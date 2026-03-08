@@ -15,22 +15,12 @@ def plot_daily_recap(instrument, date_range, close_price_df, strategy, trader):
 
     df = close_price_df.copy()
     df = df.loc[(df.index >= start_ts) & (df.index <= end_ts)]
-    df = pd.merge(
-        df,
-        strategy.generate_signals()[instrument].to_frame(name="signal"),
-        left_index=True,
-        right_index=True,
-    )
-    df["position"] = trader.generate_positions()[instrument]
-    df["pnl"] = trader.generate_net_pnl()[instrument]
+    df["signal"] = strategy.generate_signals()[instrument].reindex(df.index).fillna(0)
+    df["position"] = trader.generate_positions()[instrument].reindex(df.index).fillna(0)
+    df["pnl"] = trader.generate_net_pnl()[instrument].reindex(df.index).fillna(0)
     df["cum_pnl"] = df["pnl"].cumsum()
-    df = pd.merge(
-        df,
-        trader.generate_trades()[instrument],
-        left_index=True,
-        right_index=True,
-        how="left",
-    )
+    trades = trader.generate_trades()[instrument]
+    trades = trades.loc[(trades.index >= start_ts) & (trades.index <= end_ts)]
 
     fig = make_subplots(
         rows=4,
@@ -73,7 +63,7 @@ def plot_daily_recap(instrument, date_range, close_price_df, strategy, trader):
     )
 
     # Trades on price subplot
-    trade_markers = df[df["trade_size"].notna()]
+    trade_markers = trades[trades["trade_size"].notna()]
     buy_markers = trade_markers[trade_markers["trade_size"] > 0]
     sell_markers = trade_markers[trade_markers["trade_size"] < 0]
 
@@ -81,7 +71,7 @@ def plot_daily_recap(instrument, date_range, close_price_df, strategy, trader):
         fig.add_trace(
             go.Scatter(
                 x=buy_markers.index,
-                y=buy_markers["mid"],
+                y=buy_markers["trade_price"],
                 mode="markers",
                 marker=dict(color="green", size=10, symbol="triangle-up"),
                 name="Buy",
@@ -103,7 +93,7 @@ def plot_daily_recap(instrument, date_range, close_price_df, strategy, trader):
         fig.add_trace(
             go.Scatter(
                 x=sell_markers.index,
-                y=sell_markers["mid"],
+                y=sell_markers["trade_price"],
                 mode="markers",
                 marker=dict(color="red", size=10, symbol="triangle-down"),
                 name="Sell",

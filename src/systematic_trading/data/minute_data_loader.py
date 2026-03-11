@@ -1,6 +1,7 @@
 import datetime as dt
 import pandas as pd
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor
 from data.tick_data_loader import get_tick_quote
 
 
@@ -102,9 +103,11 @@ def get_minute_quote(
 ) -> pd.DataFrame:
     df = get_tick_quote(ccy_pair, start_date, end_date)
 
-    df = df.resample("1min", label="right", closed="right").ohlc()
+    # We only need minute-close quotes, so use last() instead of ohlc().
+    df = df[["bid", "ask", "mid"]].resample("1min", label="right", closed="right").last()
+    if df.empty:
+        return df
 
-    df = df.loc[:, df.columns.get_level_values(1) == "close"].droplevel(1, axis=1)
     full = pd.date_range(start=df.index.min(), end=df.index.max(), freq="1min")
 
     mask = (
@@ -121,10 +124,23 @@ def get_minute_quote(
 
 
 def get_minute_quotes(
-    ccy_pairs: list[str], start_date: dt.date, end_date: dt.date
+    ccy_pairs: list[str],
+    start_date: dt.date,
+    end_date: dt.date,
+    max_workers: int | None = None,
 ) -> dict[str, pd.DataFrame]:
+    if len(ccy_pairs) <= 1:
+        return {
+            ccy_pair: get_minute_quote(ccy_pair, start_date, end_date)
+            for ccy_pair in ccy_pairs
+        }
 
-    return {
-        ccy_pair: get_minute_quote(ccy_pair, start_date, end_date)
-        for ccy_pair in ccy_pairs
-    }
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        results = executor.map(
+            lambda ccy_pair: (
+                ccy_pair,
+                get_minute_quote(ccy_pair, start_date, end_date),
+            ),
+            ccy_pairs,
+        )
+        return {ccy_pair: df for ccy_pair, df in results}

@@ -11,17 +11,23 @@ class FactorMeanReversionStrategy(Strategy):
 
     def __init__(
         self,
+        instruments: tuple[str],
         close_price_dict: dict[str, pd.DataFrame],
-        zs_entry_threshold: float = 2.0,
-        zs_exit_threshold: float = 0.5,
-        spread_entry_multiplier: float = 10.0,
-        spread_exit_multiplier: float = 2.0,
+        hyper_param_dict: dict[str, float] = {
+            "zs_entry_threshold": 2.0,
+            "zs_exit_threshold": 0.0,
+            "spread_entry_multiplier": 10.0,
+            "residual_rolling_lookback": pd.Timedelta(hours=5),
+        },
     ):
+        self.instruments = instruments
         self.close_price_dict = close_price_dict
-        self.zs_entry_threshold = zs_entry_threshold
-        self.zs_exit_threshold = zs_exit_threshold
-        self.spread_entry_multiplier = spread_entry_multiplier
-        self.spread_exit_multiplier = spread_exit_multiplier
+        self.zs_entry_threshold = hyper_param_dict.get("zs_entry_threshold")
+        self.zs_exit_threshold = hyper_param_dict.get("zs_exit_threshold")
+        self.spread_entry_multiplier = hyper_param_dict.get("spread_entry_multiplier")
+        self.residual_rolling_lookback = hyper_param_dict.get(
+            "residual_rolling_lookback"
+        )
 
     def compute_mid_returns(self) -> pd.DataFrame:
 
@@ -33,80 +39,145 @@ class FactorMeanReversionStrategy(Strategy):
 
         return rets.dropna()
 
-    def rolling_regression(self, pair_ret, usd_ret, window=pd.Timedelta(14)):
+    def rolling_regression(self, pair_ret, factor_ret, window=pd.Timedelta(14)):
         """
         Compute rolling beta and residuals using
         rolling covariance / variance.
         """
 
-        df = pd.concat({"pair": pair_ret, "usd": usd_ret}, axis=1)
-        df["usd"] = df["usd"].fillna(0.0)
+        df = pd.concat({"pair": pair_ret, "factor": factor_ret}, axis=1)
+        df["factor"] = df["factor"].fillna(0.0)
         pair_ret = df["pair"]
-        usd_ret = df["usd"]
+        factor_ret = df["factor"]
 
-        cov = pair_ret.rolling(window=window).cov(usd_ret)
-        var = usd_ret.rolling(window=window).var()
+        cov = pair_ret.rolling(window=window).cov(factor_ret)
+        var = factor_ret.rolling(window=window).var()
 
         beta = cov / var
         alpha = (
             pair_ret.rolling(window=window).mean()
-            - beta * usd_ret.rolling(window).mean()
+            - beta * factor_ret.rolling(window).mean()
         )
-        fitted = alpha + beta * usd_ret
+        fitted = alpha + beta * factor_ret
 
         residuals = pair_ret - fitted
 
         return beta, residuals
 
-    def rolling_pca(
-        self, rets, window=pd.Timedelta(days=14)
-    ) -> tuple[pd.Series, pd.DataFrame]:
+    def calculate_rolling_pca_loadings(
+        self,
+        usd_rets,
+        window=pd.Timedelta(days=60),
+        calc_freq=pd.Timedelta(hours=6),
+        n_components=2,
+    ) -> tuple[dict[str, pd.DataFrame], pd.DataFrame]:
 
-        usd_series, index, loadings = [], [], []
-        idx = rets.index
-        names = list(rets.keys())
+        if isinstance(calc_freq, float):
+            calc_freq = window * calc_freq
 
-        prev_loading = None
+        agg_rets = (
+            usd_rets.resample(calc_freq, label="right", closed="right")
+            .sum()
+            .dropna(how="all")
+        )
 
-        for i in range(1, len(rets)):
+        loadings_dict = {f"PC{i+1}": [] for i in range(n_components)}
+        explained_var_dict = {f"PC{i+1}": [] for i in range(n_components)}
+        index = []
 
+        idx = agg_rets.index
+        names = list(agg_rets.keys())
+
+        prev_loadings = None
+        last_calc_time = None
+
+        for i in range(1, len(agg_rets)):
             t = idx[i]
             start_t = t - window
             left = idx.searchsorted(start_t, side="left")
 
-            window_data = rets.iloc[left:i]
+            window_data = agg_rets.iloc[left:i]
 
             # Only run PCA when full window is available
             if window_data.empty or (t - window_data.index[0] < window):
                 continue
 
-            X = mad_clip(window_data, z=5.0)
+            # Check if we should calculate PCA at this timestamp
+            should_calculate = (
+                last_calc_time is None or (t - last_calc_time) >= calc_freq
+            )
 
-            pca = PCA(n_components=1)
-            pca.fit(X)
+            if should_calculate:
+                X = mad_clip(window_data, z=5.0)
 
-            loading = pca.components_[0]
+                pca = PCA(n_components=n_components)
+                pca.fit(X)
 
-            # Stabilize eigenvector sign
-            if prev_loading is not None:
-                if np.dot(loading, prev_loading) < 0:
-                    loading = -loading
+                current_loadings = pca.components_  # Shape: (n_components, n_features)
+                explained_variance_ratio = (
+                    pca.explained_variance_ratio_
+                )  # Shape: (n_components,)
 
-            prev_loading = loading
+                # Stabilize eigenvector sign
+                if prev_loadings is not None:
+                    for comp_idx in range(n_components):
+                        if (
+                            np.dot(current_loadings[comp_idx], prev_loadings[comp_idx])
+                            < 0
+                        ):
+                            current_loadings[comp_idx] = -current_loadings[comp_idx]
 
-            # Project current return (causal)
-            current_ret = rets.iloc[i]
-            usd_val = np.dot(current_ret, loading)
+                prev_loadings = current_loadings.copy()
+                last_calc_time = t
 
-            loadings.append(loading)
-            usd_series.append(usd_val)
-            index.append(rets.index[i])
+                # Store loadings for each component
+                for comp_idx in range(n_components):
+                    pc_name = f"PC{comp_idx+1}"
+                    loadings_dict[pc_name].append(current_loadings[comp_idx])
+                    explained_var_dict[pc_name].append(
+                        explained_variance_ratio[comp_idx]
+                    )
 
-        return pd.Series(usd_series, index=index, name="USD_index"), pd.DataFrame(
-            loadings, index=index, columns=names
+                index.append(t)
+
+        # Create loadings DataFrames (one per component)
+        loadings_df = {
+            pc_name: pd.DataFrame(loadings_dict[pc_name], index=index, columns=names)
+            for pc_name in loadings_dict.keys()
+        }
+
+        # Create explained variance DataFrame
+        explained_var_df = pd.DataFrame(explained_var_dict, index=index)
+
+        return loadings_df, explained_var_df
+
+    def rolling_pca(
+        self,
+        rets,
+        window=pd.Timedelta(days=14),
+        calc_freq=pd.Timedelta(hours=12),
+        n_components=2,
+    ) -> pd.DataFrame:
+
+        usd_rets = rets.filter(regex="USD").copy()
+
+        loadings_by_pc, _ = self.calculate_rolling_pca_loadings(
+            usd_rets, window=window, calc_freq=calc_freq, n_components=n_components
         )
 
-    def usd_basket_index(self, rets) -> pd.Series:
+        usd_series_by_pc: dict[str, pd.Series] = {}
+        for pc_name, pc_loadings in loadings_by_pc.items():
+            if pc_loadings.empty:
+                continue
+            aligned_loadings = pc_loadings.reindex(usd_rets.index, method="ffill")
+            usd_series_by_pc[pc_name] = (usd_rets * aligned_loadings).sum(axis=1)
+
+        usd_series_df = pd.DataFrame(usd_series_by_pc, index=usd_rets.index)
+        usd_series_df = usd_series_df.dropna(how="all")
+
+        return usd_series_df
+
+    def customised_usd_basket(self, rets) -> pd.Series:
 
         signed_rets = []
 
@@ -119,7 +190,7 @@ class FactorMeanReversionStrategy(Strategy):
 
         basket = pd.concat(signed_rets, axis=1).mean(axis=1)
 
-        basket.name = "USD_index"
+        basket.name = "USD_Basket"
 
         return basket
 
@@ -154,10 +225,15 @@ class FactorMeanReversionStrategy(Strategy):
             return cached
 
         if method == "rolling_pca":
-            factor = self.rolling_pca(rets, window)[0]
+            factor_df = self.rolling_pca(rets, window)
+            factor = (
+                factor_df["PC1"] if "PC1" in factor_df.columns else factor_df.iloc[:, 0]
+            )
 
         elif method == "basket":
-            factor = self.usd_basket_index(rets)
+            factor = self.customised_usd_basket(rets)
+        elif method == "dxy":
+            factor = rets["UDXUSD"]
 
         else:
             raise ValueError("Unknown USD factor method")
@@ -168,8 +244,7 @@ class FactorMeanReversionStrategy(Strategy):
     def generate_signals(self) -> dict[str, pd.Series]:
 
         factor_pca_rolling_lookback = pd.Timedelta(days=14)
-        residual_rolling_lookback = pd.Timedelta(hours=5)
-        spread_rolling_lookback = pd.Timedelta(minutes=120)
+        spread_rolling_lookback = pd.Timedelta(minutes=30)
 
         # Mid returns
         rets = self.compute_mid_returns()
@@ -181,7 +256,7 @@ class FactorMeanReversionStrategy(Strategy):
 
         signals = {}
 
-        for pair in rets.columns:
+        for pair in self.instruments:
 
             beta, residuals = self.rolling_regression(
                 rets[pair], factor, window=factor_pca_rolling_lookback
@@ -189,7 +264,7 @@ class FactorMeanReversionStrategy(Strategy):
             # beta, residuals = kalman_regression(rets[pair], usd_index)
 
             # cum_resid = residuals.cumsum()
-            cum_resid = residuals.rolling(window=residual_rolling_lookback).sum()
+            cum_resid = residuals.rolling(window=self.residual_rolling_lookback).sum()
 
             mean = cum_resid.rolling(window=factor_pca_rolling_lookback).mean()
             std = cum_resid.rolling(window=factor_pca_rolling_lookback).std()
@@ -204,10 +279,6 @@ class FactorMeanReversionStrategy(Strategy):
                 spread_ret.rolling(window=spread_rolling_lookback).mean()
                 * self.spread_entry_multiplier
             ).reindex(z.index)
-            ret_exit_threshold = (
-                spread_ret.rolling(window=spread_rolling_lookback).mean()
-                * self.spread_exit_multiplier
-            ).reindex(z.index)
 
             signal = pd.Series(0, index=z.index, dtype=int)
             position = 0
@@ -216,14 +287,8 @@ class FactorMeanReversionStrategy(Strategy):
                 z_val = z.loc[ts]
                 resid_val = cum_resid.loc[ts]
                 entry_th = ret_entry_threshold.loc[ts]
-                exit_th = ret_exit_threshold.loc[ts]
 
-                if (
-                    pd.isna(z_val)
-                    or pd.isna(resid_val)
-                    or pd.isna(entry_th)
-                    or pd.isna(exit_th)
-                ):
+                if pd.isna(z_val) or pd.isna(resid_val) or pd.isna(entry_th):
                     signal.loc[ts] = 0
                     continue
 
@@ -235,11 +300,11 @@ class FactorMeanReversionStrategy(Strategy):
                         position = -1
                 elif position == 1:
                     # Exit long when residual has sufficiently mean-reverted
-                    if (z_val > -self.zs_exit_threshold) or (resid_val > -exit_th):
+                    if z_val > -self.zs_exit_threshold:
                         position = 0
                 elif position == -1:
                     # Exit short when residual has sufficiently mean-reverted
-                    if (z_val < self.zs_exit_threshold) or (resid_val < exit_th):
+                    if z_val < self.zs_exit_threshold:
                         position = 0
 
                 signal.loc[ts] = position

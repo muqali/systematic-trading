@@ -1,5 +1,6 @@
 import pandas as pd
 import numpy as np
+import matplotlib.pyplot as plt
 
 from trading.trader import Trader
 
@@ -147,3 +148,28 @@ class PerformanceReport:
         report_df = pd.DataFrame(report_dict).T
 
         return report_df
+
+    def plot_cumulative_pnl(
+        self,
+        instrument: str,
+        ax=None,
+        title: str | None = None,
+    ):
+        net_pnl = self.net_pnl_dict[instrument]
+        gross_pnl = self.gross_pnl_dict[instrument]
+        cumulative_net = net_pnl.cumsum()
+        cumulative_gross = gross_pnl.cumsum()
+
+        if ax is None:
+            _, ax = plt.subplots()
+
+        cumulative_net.plot(ax=ax, label="Net")
+        cumulative_gross.plot(ax=ax, label="Gross")
+        plot_title = title or f"{instrument} Cumulative PnL"
+        ax.set_title(plot_title)
+        ax.set_xlabel("Time")
+        ax.set_ylabel("Cumulative PnL")
+        ax.grid(True, alpha=0.3)
+        ax.legend()
+
+        return ax

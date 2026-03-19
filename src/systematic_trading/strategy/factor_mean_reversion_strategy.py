@@ -69,7 +69,7 @@ class FactorMeanReversionStrategy(Strategy):
         usd_rets,
         window=pd.Timedelta(days=60),
         calc_freq=pd.Timedelta(hours=6),
-        n_components=2,
+        n_components=1,
     ) -> tuple[dict[str, pd.DataFrame], pd.DataFrame]:
 
         if isinstance(calc_freq, float):
@@ -154,12 +154,12 @@ class FactorMeanReversionStrategy(Strategy):
     def rolling_pca(
         self,
         rets,
-        window=pd.Timedelta(days=14),
-        calc_freq=pd.Timedelta(hours=12),
-        n_components=2,
+        window=pd.Timedelta(days=60),
+        calc_freq=pd.Timedelta(hours=6),
+        n_components=1,
     ) -> pd.DataFrame:
 
-        usd_rets = rets.filter(regex="USD").copy()
+        usd_rets = rets.filter(regex="^(?!.*UDX).*USD")
 
         loadings_by_pc, _ = self.calculate_rolling_pca_loadings(
             usd_rets, window=window, calc_freq=calc_freq, n_components=n_components
@@ -217,7 +217,7 @@ class FactorMeanReversionStrategy(Strategy):
         )
 
     def compute_principal_factor(
-        self, rets, method="rolling_pca", window=pd.Timedelta(days=14)
+        self, rets, method="rolling_pca", window=pd.Timedelta(days=60)
     ):
         cache_key = self._principal_factor_cache_key(rets, method, window)
         cached = self.__class__._principal_factor_cache.get(cache_key)
@@ -243,7 +243,7 @@ class FactorMeanReversionStrategy(Strategy):
 
     def generate_signals(self) -> dict[str, pd.Series]:
 
-        factor_pca_rolling_lookback = pd.Timedelta(days=14)
+        factor_pca_rolling_lookback = pd.Timedelta(days=60)
         spread_rolling_lookback = pd.Timedelta(minutes=30)
 
         # Mid returns
@@ -311,4 +311,99 @@ class FactorMeanReversionStrategy(Strategy):
 
             signals[pair] = signal
 
+        return signals
+
+    def generate_signals2(self) -> dict[str, pd.Series]:
+
+        factor_pca_rolling_lookback = pd.Timedelta(days=60)
+        spread_rolling_lookback = pd.Timedelta(minutes=30)
+
+        # Mid returns
+        rets = self.compute_mid_returns()
+
+        # USD factor and loadings
+        factor = self.compute_principal_factor(
+            rets, method="rolling_pca", window=factor_pca_rolling_lookback
+        )
+        loadings_by_pc, _ = self.calculate_rolling_pca_loadings(
+            rets.filter(regex="^(?!.*UDX).*USD"),
+            window=factor_pca_rolling_lookback,
+            calc_freq=pd.Timedelta(hours=12),
+            n_components=2,
+        )
+
+        signals: dict[str, pd.Series] = {}
+        hedge_positions: dict[str, pd.Series] = {
+            pair: pd.Series(0.0, index=rets.index, dtype=float) for pair in rets.columns
+        }
+
+        for pair in self.instruments:
+
+            beta, residuals = self.rolling_regression(
+                rets[pair], factor, window=factor_pca_rolling_lookback
+            )
+
+            cum_resid = residuals.rolling(window=self.residual_rolling_lookback).sum()
+
+            mean = cum_resid.rolling(window=factor_pca_rolling_lookback).mean()
+            std = cum_resid.rolling(window=factor_pca_rolling_lookback).std()
+
+            z = (cum_resid - mean) / std
+            pair_df = self.close_price_dict[pair]
+            spread_ret = ((pair_df["ask"] - pair_df["bid"]) / pair_df["mid"]).replace(
+                [np.inf, -np.inf], np.nan
+            )
+
+            ret_entry_threshold = (
+                spread_ret.rolling(window=spread_rolling_lookback).mean()
+                * self.spread_entry_multiplier
+            ).reindex(z.index)
+
+            signal = pd.Series(0, index=z.index, dtype=int)
+            position = 0
+
+            for ts in z.index:
+                z_val = z.loc[ts]
+                resid_val = cum_resid.loc[ts]
+                entry_th = ret_entry_threshold.loc[ts]
+
+                if pd.isna(z_val) or pd.isna(resid_val) or pd.isna(entry_th):
+                    signal.loc[ts] = 0
+                    continue
+
+                if position == 0:
+                    if (z_val < -self.zs_entry_threshold) and (resid_val < -entry_th):
+                        position = 1
+                    elif (z_val > self.zs_entry_threshold) and (resid_val > entry_th):
+                        position = -1
+                elif position == 1:
+                    if z_val > -self.zs_exit_threshold:
+                        position = 0
+                elif position == -1:
+                    if z_val < self.zs_exit_threshold:
+                        position = 0
+
+                signal.loc[ts] = position
+
+            signals[pair] = signal
+
+            beta_aligned = beta.reindex(signal.index)
+            scale = (
+                (-signal * beta_aligned).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+            )
+
+            # Apply hedge in each factor component using its loadings
+            for pc_name, pc_loadings in loadings_by_pc.items():
+                if pc_loadings.empty:
+                    continue
+                aligned_loadings = pc_loadings.reindex(rets.index, method="ffill")
+                for hedge_pair in aligned_loadings.columns:
+                    hedge_positions[hedge_pair] = hedge_positions[hedge_pair].add(
+                        scale * aligned_loadings[hedge_pair], fill_value=0.0
+                    )
+
+        for pair, hedge_series in hedge_positions.items():
+            signals[pair] = signals.get(pair, pd.Series(0, index=rets.index)).add(
+                hedge_series, fill_value=0.0
+            )
         return signals

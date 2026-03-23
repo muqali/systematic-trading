@@ -22,6 +22,7 @@ class FactorMeanReversionStrategy(Strategy):
             "zs_exit_threshold": 0.0,
             "spread_entry_multiplier": 10.0,
             "residual_rolling_lookback": pd.Timedelta(hours=5),
+            "n_components": 2
         },
     ):
         self.instruments = instruments
@@ -32,6 +33,7 @@ class FactorMeanReversionStrategy(Strategy):
         self.residual_rolling_lookback = hyper_param_dict.get(
             "residual_rolling_lookback"
         )
+        self.n_components = hyper_param_dict.get("n_components")
 
     def compute_mid_returns(self) -> pd.DataFrame:
 
@@ -140,7 +142,7 @@ class FactorMeanReversionStrategy(Strategy):
         beta = beta_calc.reindex(pair_ret.index, method="ffill")
         alpha = alpha_calc.reindex(pair_ret.index, method="ffill")
         factors_ret = factors_ret.fillna(0.0)
-        fitted = alpha + (factors_ret * beta).sum(axis=1)
+        fitted = (factors_ret * beta).sum(axis=1)
         residuals = pair_ret - fitted
 
         return beta, residuals
@@ -290,7 +292,13 @@ class FactorMeanReversionStrategy(Strategy):
         return basket.to_frame()
 
     def _principal_factor_cache_key(
-        self, rets: pd.DataFrame, method: str, window: Union[str, pd.Timedelta]
+        self,
+        rets: pd.DataFrame,
+        method: str,
+        window: Union[str, pd.Timedelta],
+        return_bucket_length: Union[str, pd.Timedelta],
+        calc_freq: Union[str, pd.Timedelta],
+        n_components: int,
     ) -> tuple:
         if len(rets.index) == 0:
             first_ts = None
@@ -300,11 +308,16 @@ class FactorMeanReversionStrategy(Strategy):
             last_ts = rets.index[-1]
 
         window_key = str(pd.Timedelta(window))
+        return_bucket_length_key = str(pd.Timedelta(return_bucket_length))
+        calc_freq_key = str(pd.Timedelta(calc_freq))
 
         return (
             id(self.close_price_dict),
             method,
             window_key,
+            return_bucket_length_key,
+            calc_freq_key,
+            n_components,
             rets.shape,
             tuple(rets.columns),
             first_ts,
@@ -312,15 +325,34 @@ class FactorMeanReversionStrategy(Strategy):
         )
 
     def compute_principal_factor(
-        self, rets, method="rolling_pca", window=pd.Timedelta(days=60), n_component=1
+        self,
+        rets,
+        method="rolling_pca",
+        window=pd.Timedelta(days=60),
+        return_bucket_length=pd.Timedelta(hours=6),
+        calc_freq=pd.Timedelta(days=7),
+        n_components=1,
     ) -> pd.DataFrame:
-        cache_key = self._principal_factor_cache_key(rets, method, window)
+        cache_key = self._principal_factor_cache_key(
+            rets,
+            method,
+            window,
+            return_bucket_length,
+            calc_freq,
+            n_components,
+        )
         cached = self.__class__._principal_factor_cache.get(cache_key)
         if cached is not None:
             return cached
 
         if method == "rolling_pca":
-            factor = self.rolling_pca(rets, window=window)
+            factor = self.rolling_pca(
+                rets,
+                window=window,
+                return_bucket_length=return_bucket_length,
+                calc_freq=calc_freq,
+                n_components=n_components,
+            )
 
         elif method == "basket":
             factor = self.customised_usd_basket(rets)
@@ -343,7 +375,12 @@ class FactorMeanReversionStrategy(Strategy):
 
         # USD factor
         factor = self.compute_principal_factor(
-            rets, method="rolling_pca", window=factor_pca_rolling_lookback
+            rets,
+            method="rolling_pca",
+            window=factor_pca_rolling_lookback,
+            return_bucket_length=pd.Timedelta(hours=6),
+            calc_freq=pd.Timedelta(days=7),
+            n_components=1,
         )
 
         signals = {}
@@ -418,13 +455,19 @@ class FactorMeanReversionStrategy(Strategy):
 
         # USD factor and loadings
         factor = self.compute_principal_factor(
-            rets, method="rolling_pca", window=factor_pca_rolling_lookback
+            rets,
+            method="rolling_pca",
+            window=factor_pca_rolling_lookback,
+            return_bucket_length=pd.Timedelta(hours=6),
+            calc_freq=pd.Timedelta(days=7),
+            n_components=self.n_components,
         )
+
         loadings_by_pc, _ = self.calculate_rolling_pca_loadings(
             rets.filter(regex="^(?!.*UDX).*USD"),
             window=factor_pca_rolling_lookback,
             return_bucket_length=pd.Timedelta(hours=12),
-            n_components=2,
+            n_components=self.n_components,
         )
 
         signals: dict[str, pd.Series] = {}

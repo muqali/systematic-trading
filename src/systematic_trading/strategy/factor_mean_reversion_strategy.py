@@ -9,6 +9,10 @@ from typing import Union
 class FactorMeanReversionStrategy(Strategy):
     _principal_factor_cache: dict[tuple, pd.Series] = {}
 
+    @classmethod
+    def _is_after_4pm_on_friday(cls, ts: pd.Timestamp) -> bool:
+        return ts.dayofweek == 4 and ts.hour >= 16
+
     def __init__(
         self,
         instruments: tuple[str],
@@ -39,106 +43,192 @@ class FactorMeanReversionStrategy(Strategy):
 
         return rets.dropna()
 
-    def rolling_regression(self, pair_ret, factor_ret, window=pd.Timedelta(14)):
+    def rolling_regression(
+        self,
+        pair_ret,
+        factors_ret,
+        window=pd.Timedelta(days=60),
+        return_bucket_length=pd.Timedelta(hours=6),
+        calc_freq=pd.Timedelta(days=7),
+    ):
         """
-        Compute rolling beta and residuals using
-        rolling covariance / variance.
+        Compute rolling multi-factor OLS exposures and residuals.
         """
 
-        df = pd.concat({"pair": pair_ret, "factor": factor_ret}, axis=1)
-        df["factor"] = df["factor"].fillna(0.0)
+        if isinstance(pair_ret, pd.DataFrame):
+            if pair_ret.shape[1] != 1:
+                raise ValueError("pair_ret must be a Series or single-column DataFrame")
+            pair_ret = pair_ret.iloc[:, 0]
+        if isinstance(factors_ret, pd.Series):
+            factors_ret = factors_ret.to_frame()
+        elif not isinstance(factors_ret, pd.DataFrame):
+            raise ValueError("factors_ret must be a Series or DataFrame")
+
+        if isinstance(return_bucket_length, float):
+            return_bucket_length = window * return_bucket_length
+        if isinstance(calc_freq, float):
+            calc_freq = window * calc_freq
+
+        factors_ret = factors_ret.copy()
+        df = pd.concat([pair_ret.rename("pair"), factors_ret], axis=1).sort_index()
+        df = df.dropna(subset=["pair"])
+
         pair_ret = df["pair"]
-        factor_ret = df["factor"]
+        factors_ret = df[factors_ret.columns]
+        factor_cols = list(factors_ret.columns)
 
-        cov = pair_ret.rolling(window=window).cov(factor_ret)
-        var = factor_ret.rolling(window=window).var()
+        beta_calc = pd.DataFrame([], columns=factor_cols, dtype=float)
+        alpha_calc = pd.Series(dtype=float)
+        idx = pair_ret.index
+        last_checked_friday = None
 
-        beta = cov / var
-        alpha = (
-            pair_ret.rolling(window=window).mean()
-            - beta * factor_ret.rolling(window).mean()
-        )
-        fitted = alpha + beta * factor_ret
+        for i in range(len(idx)):
+            t = idx[i]
+            friday_key = t.normalize() if self._is_after_4pm_on_friday(t) else None
+            if friday_key is None or friday_key == last_checked_friday:
+                continue
+            last_checked_friday = friday_key
 
+            should_calculate = (
+                beta_calc.empty
+                or alpha_calc.empty
+                or (t - alpha_calc.index[-1]) >= calc_freq
+            )
+            if not should_calculate:
+                continue
+
+            pair_until_t = pair_ret.loc[:t]
+            factors_until_t = factors_ret.loc[:t]
+            agg_pair = pair_until_t.resample(
+                return_bucket_length, label="right", closed="right"
+            ).sum(min_count=1)
+            agg_factors = factors_until_t.resample(
+                return_bucket_length, label="right", closed="right"
+            ).sum(min_count=1)
+            agg_df = pd.concat([agg_pair.rename("pair"), agg_factors], axis=1).dropna(
+                subset=["pair"]
+            )
+            if agg_df.empty:
+                continue
+            agg_df[factor_cols] = agg_df[factor_cols].fillna(0.0)
+
+            start_t = t - window - calc_freq
+            left = agg_df.index.searchsorted(start_t, side="left")
+            right = agg_df.index.searchsorted(t, side="right")
+            window_data = agg_df.iloc[left:right]
+
+            if window_data.empty or (t - window_data.index[0] < window):
+                continue
+
+            y = window_data["pair"]
+            X = window_data[factor_cols]
+            mean_y = y.mean()
+            mean_x = X.mean()
+            centered = pd.concat([y - mean_y, X - mean_x], axis=1)
+            cov_t = centered.cov()
+            sigma_xx = cov_t.loc[factor_cols, factor_cols].to_numpy()
+            sigma_xy = cov_t.loc[factor_cols, "pair"].to_numpy()
+
+            try:
+                beta_vals = np.linalg.solve(sigma_xx, sigma_xy)
+            except np.linalg.LinAlgError:
+                beta_vals = np.linalg.pinv(sigma_xx) @ sigma_xy
+
+            beta_calc.loc[t, factor_cols] = beta_vals
+            alpha_calc.loc[t] = mean_y - np.dot(mean_x.to_numpy(), beta_vals)
+
+        beta = beta_calc.reindex(pair_ret.index, method="ffill")
+        alpha = alpha_calc.reindex(pair_ret.index, method="ffill")
+        factors_ret = factors_ret.fillna(0.0)
+        fitted = alpha + (factors_ret * beta).sum(axis=1)
         residuals = pair_ret - fitted
 
         return beta, residuals
 
     def calculate_rolling_pca_loadings(
         self,
-        usd_rets,
+        rets,
         window=pd.Timedelta(days=60),
-        calc_freq=pd.Timedelta(hours=6),
-        n_components=1,
+        return_bucket_length=pd.Timedelta(hours=6),
+        calc_freq=pd.Timedelta(days=7),
+        n_components=2,
     ) -> tuple[dict[str, pd.DataFrame], pd.DataFrame]:
 
+        if isinstance(return_bucket_length, float):
+            return_bucket_length = window * return_bucket_length
         if isinstance(calc_freq, float):
             calc_freq = window * calc_freq
-
-        agg_rets = (
-            usd_rets.resample(calc_freq, label="right", closed="right")
-            .sum()
-            .dropna(how="all")
-        )
 
         loadings_dict = {f"PC{i+1}": [] for i in range(n_components)}
         explained_var_dict = {f"PC{i+1}": [] for i in range(n_components)}
         index = []
 
-        idx = agg_rets.index
-        names = list(agg_rets.keys())
+        idx = rets.index
+        names = list(rets.keys())
 
         prev_loadings = None
         last_calc_time = None
+        last_checked_friday = None
 
-        for i in range(1, len(agg_rets)):
+        for i in range(len(idx)):
             t = idx[i]
-            start_t = t - window
-            left = idx.searchsorted(start_t, side="left")
+            friday_key = t.normalize() if self._is_after_4pm_on_friday(t) else None
+            if friday_key is None or friday_key == last_checked_friday:
+                continue
+            last_checked_friday = friday_key
 
-            window_data = agg_rets.iloc[left:i]
+            should_calculate = (
+                last_calc_time is None or (t - last_calc_time) >= calc_freq
+            )
+            if not should_calculate:
+                continue
+
+            rets_until_t = rets.loc[:t]
+            agg_rets = (
+                rets_until_t.resample(
+                    return_bucket_length, label="right", closed="right"
+                )
+                .sum()
+                .dropna(how="all")
+            )
+            if agg_rets.empty:
+                continue
+
+            start_t = t - window - calc_freq
+            left = agg_rets.index.searchsorted(start_t, side="left")
+            right = agg_rets.index.searchsorted(t, side="right")
+            window_data = agg_rets.iloc[left:right]
 
             # Only run PCA when full window is available
             if window_data.empty or (t - window_data.index[0] < window):
                 continue
 
-            # Check if we should calculate PCA at this timestamp
-            should_calculate = (
-                last_calc_time is None or (t - last_calc_time) >= calc_freq
-            )
+            X = mad_clip(window_data, z=5.0)
 
-            if should_calculate:
-                X = mad_clip(window_data, z=5.0)
+            pca = PCA(n_components=n_components)
+            pca.fit(X)
 
-                pca = PCA(n_components=n_components)
-                pca.fit(X)
+            current_loadings = pca.components_  # Shape: (n_components, n_features)
+            explained_variance_ratio = (
+                pca.explained_variance_ratio_
+            )  # Shape: (n_components,)
 
-                current_loadings = pca.components_  # Shape: (n_components, n_features)
-                explained_variance_ratio = (
-                    pca.explained_variance_ratio_
-                )  # Shape: (n_components,)
-
-                # Stabilize eigenvector sign
-                if prev_loadings is not None:
-                    for comp_idx in range(n_components):
-                        if (
-                            np.dot(current_loadings[comp_idx], prev_loadings[comp_idx])
-                            < 0
-                        ):
-                            current_loadings[comp_idx] = -current_loadings[comp_idx]
-
-                prev_loadings = current_loadings.copy()
-                last_calc_time = t
-
-                # Store loadings for each component
+            # Stabilize eigenvector sign
+            if prev_loadings is not None:
                 for comp_idx in range(n_components):
-                    pc_name = f"PC{comp_idx+1}"
-                    loadings_dict[pc_name].append(current_loadings[comp_idx])
-                    explained_var_dict[pc_name].append(
-                        explained_variance_ratio[comp_idx]
-                    )
+                    if np.dot(current_loadings[comp_idx], prev_loadings[comp_idx]) < 0:
+                        current_loadings[comp_idx] = -current_loadings[comp_idx]
 
-                index.append(t)
+            prev_loadings = current_loadings.copy()
+            last_calc_time = t
+
+            # Store loadings for each component
+            for comp_idx in range(n_components):
+                pc_name = f"PC{comp_idx+1}"
+                loadings_dict[pc_name].append(current_loadings[comp_idx])
+                explained_var_dict[pc_name].append(explained_variance_ratio[comp_idx])
+
+            index.append(t)
 
         # Create loadings DataFrames (one per component)
         loadings_df = {
@@ -155,14 +245,19 @@ class FactorMeanReversionStrategy(Strategy):
         self,
         rets,
         window=pd.Timedelta(days=60),
-        calc_freq=pd.Timedelta(hours=6),
-        n_components=1,
+        return_bucket_length=pd.Timedelta(hours=6),
+        calc_freq=pd.Timedelta(days=7),
+        n_components=2,
     ) -> pd.DataFrame:
 
         usd_rets = rets.filter(regex="^(?!.*UDX).*USD")
 
         loadings_by_pc, _ = self.calculate_rolling_pca_loadings(
-            usd_rets, window=window, calc_freq=calc_freq, n_components=n_components
+            usd_rets,
+            window=window,
+            return_bucket_length=return_bucket_length,
+            calc_freq=calc_freq,
+            n_components=n_components,
         )
 
         usd_series_by_pc: dict[str, pd.Series] = {}
@@ -177,7 +272,7 @@ class FactorMeanReversionStrategy(Strategy):
 
         return usd_series_df
 
-    def customised_usd_basket(self, rets) -> pd.Series:
+    def customised_usd_basket(self, rets) -> pd.DataFrame:
 
         signed_rets = []
 
@@ -192,7 +287,7 @@ class FactorMeanReversionStrategy(Strategy):
 
         basket.name = "USD_Basket"
 
-        return basket
+        return basket.to_frame()
 
     def _principal_factor_cache_key(
         self, rets: pd.DataFrame, method: str, window: Union[str, pd.Timedelta]
@@ -217,23 +312,20 @@ class FactorMeanReversionStrategy(Strategy):
         )
 
     def compute_principal_factor(
-        self, rets, method="rolling_pca", window=pd.Timedelta(days=60)
-    ):
+        self, rets, method="rolling_pca", window=pd.Timedelta(days=60), n_component=1
+    ) -> pd.DataFrame:
         cache_key = self._principal_factor_cache_key(rets, method, window)
         cached = self.__class__._principal_factor_cache.get(cache_key)
         if cached is not None:
             return cached
 
         if method == "rolling_pca":
-            factor_df = self.rolling_pca(rets, window)
-            factor = (
-                factor_df["PC1"] if "PC1" in factor_df.columns else factor_df.iloc[:, 0]
-            )
+            factor = self.rolling_pca(rets, window=window)
 
         elif method == "basket":
             factor = self.customised_usd_basket(rets)
         elif method == "dxy":
-            factor = rets["UDXUSD"]
+            factor = rets["UDXUSD"].to_frame()
 
         else:
             raise ValueError("Unknown USD factor method")
@@ -294,6 +386,9 @@ class FactorMeanReversionStrategy(Strategy):
 
                 if position == 0:
                     # Entry conditions
+                    if self._is_after_4pm_on_friday(ts):
+                        signal.loc[ts] = 0
+                        continue
                     if (z_val < -self.zs_entry_threshold) and (resid_val < -entry_th):
                         position = 1
                     elif (z_val > self.zs_entry_threshold) and (resid_val > entry_th):
@@ -328,7 +423,7 @@ class FactorMeanReversionStrategy(Strategy):
         loadings_by_pc, _ = self.calculate_rolling_pca_loadings(
             rets.filter(regex="^(?!.*UDX).*USD"),
             window=factor_pca_rolling_lookback,
-            calc_freq=pd.Timedelta(hours=12),
+            return_bucket_length=pd.Timedelta(hours=12),
             n_components=2,
         )
 
@@ -372,6 +467,9 @@ class FactorMeanReversionStrategy(Strategy):
                     continue
 
                 if position == 0:
+                    if self._is_after_4pm_on_friday(ts):
+                        signal.loc[ts] = 0
+                        continue
                     if (z_val < -self.zs_entry_threshold) and (resid_val < -entry_th):
                         position = 1
                     elif (z_val > self.zs_entry_threshold) and (resid_val > entry_th):
@@ -387,15 +485,18 @@ class FactorMeanReversionStrategy(Strategy):
 
             signals[pair] = signal
 
-            beta_aligned = beta.reindex(signal.index)
-            scale = (
-                (-signal * beta_aligned).replace([np.inf, -np.inf], np.nan).fillna(0.0)
-            )
-
             # Apply hedge in each factor component using its loadings
             for pc_name, pc_loadings in loadings_by_pc.items():
                 if pc_loadings.empty:
                     continue
+                if pc_name not in beta.columns:
+                    continue
+                beta_aligned = beta[pc_name].reindex(signal.index)
+                scale = (
+                    (-signal * beta_aligned)
+                    .replace([np.inf, -np.inf], np.nan)
+                    .fillna(0.0)
+                )
                 aligned_loadings = pc_loadings.reindex(rets.index, method="ffill")
                 for hedge_pair in aligned_loadings.columns:
                     hedge_positions[hedge_pair] = hedge_positions[hedge_pair].add(

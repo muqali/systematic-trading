@@ -365,6 +365,79 @@ class FactorMeanReversionStrategy(Strategy):
         self.__class__._principal_factor_cache[cache_key] = factor
         return factor
 
+    def _generate_pair_signal_series(
+        self,
+        z: pd.Series,
+        cum_resid: pd.Series,
+        ret_entry_threshold: pd.Series,
+    ) -> pd.Series:
+        signal = pd.Series(0, index=z.index, dtype=int)
+        position = 0
+
+        for ts in z.index:
+            z_val = z.loc[ts]
+            resid_val = cum_resid.loc[ts]
+            entry_th = ret_entry_threshold.loc[ts]
+
+            if pd.isna(z_val) or pd.isna(resid_val) or pd.isna(entry_th):
+                signal.loc[ts] = 0
+                continue
+
+            if position == 0:
+                if self._is_after_4pm_on_friday(ts):
+                    signal.loc[ts] = 0
+                    continue
+                if (z_val < -self.zs_entry_threshold) and (resid_val < -entry_th):
+                    position = 1
+                elif (z_val > self.zs_entry_threshold) and (resid_val > entry_th):
+                    position = -1
+            elif position == 1:
+                if z_val > -self.zs_exit_threshold:
+                    position = 0
+            elif position == -1:
+                if z_val < self.zs_exit_threshold:
+                    position = 0
+
+            signal.loc[ts] = position
+
+        return signal
+
+    def _factor_neutralize_pair_weights(
+        self,
+        raw_weights: pd.Series,
+        beta_matrix: pd.DataFrame,
+    ) -> pd.Series:
+        weights = raw_weights.astype(float).fillna(0.0)
+        betas = beta_matrix.reindex(index=weights.index).fillna(0.0)
+        active = weights[weights != 0.0].index
+
+        neutral_weights = pd.Series(0.0, index=weights.index, dtype=float)
+        if len(active) == 0:
+            return neutral_weights
+
+        active_weights = weights.loc[active]
+        active_betas = betas.loc[active]
+        B = active_betas.to_numpy(dtype=float)
+        s = active_weights.to_numpy(dtype=float)
+
+        if B.size == 0 or np.allclose(B, 0.0):
+            neutral_weights.loc[active] = active_weights
+            return neutral_weights
+
+        gram = B.T @ B
+        factor_projection = B @ (np.linalg.pinv(gram) @ (B.T @ s))
+        projected = s - factor_projection
+
+        raw_gross = np.abs(s).sum()
+        projected_gross = np.abs(projected).sum()
+        if projected_gross > 0 and raw_gross > 0:
+            projected = projected * (raw_gross / projected_gross)
+
+        projected[np.abs(projected) < 1e-10] = 0.0
+        neutral_weights.loc[active] = projected
+
+        return neutral_weights
+
     def generate_signals(self) -> dict[str, pd.Series]:
 
         factor_pca_rolling_lookback = pd.Timedelta(days=60)
@@ -409,37 +482,7 @@ class FactorMeanReversionStrategy(Strategy):
                 * self.spread_entry_multiplier
             ).reindex(z.index)
 
-            signal = pd.Series(0, index=z.index, dtype=int)
-            position = 0
-
-            for ts in z.index:
-                z_val = z.loc[ts]
-                resid_val = cum_resid.loc[ts]
-                entry_th = ret_entry_threshold.loc[ts]
-
-                if pd.isna(z_val) or pd.isna(resid_val) or pd.isna(entry_th):
-                    signal.loc[ts] = 0
-                    continue
-
-                if position == 0:
-                    # Entry conditions
-                    if self._is_after_4pm_on_friday(ts):
-                        signal.loc[ts] = 0
-                        continue
-                    if (z_val < -self.zs_entry_threshold) and (resid_val < -entry_th):
-                        position = 1
-                    elif (z_val > self.zs_entry_threshold) and (resid_val > entry_th):
-                        position = -1
-                elif position == 1:
-                    # Exit long when residual has sufficiently mean-reverted
-                    if z_val > -self.zs_exit_threshold:
-                        position = 0
-                elif position == -1:
-                    # Exit short when residual has sufficiently mean-reverted
-                    if z_val < self.zs_exit_threshold:
-                        position = 0
-
-                signal.loc[ts] = position
+            signal = self._generate_pair_signal_series(z, cum_resid, ret_entry_threshold)
 
             signals[pair] = signal
 
@@ -497,34 +540,7 @@ class FactorMeanReversionStrategy(Strategy):
                 * self.spread_entry_multiplier
             ).reindex(z.index)
 
-            signal = pd.Series(0, index=z.index, dtype=int)
-            position = 0
-
-            for ts in z.index:
-                z_val = z.loc[ts]
-                resid_val = cum_resid.loc[ts]
-                entry_th = ret_entry_threshold.loc[ts]
-
-                if pd.isna(z_val) or pd.isna(resid_val) or pd.isna(entry_th):
-                    signal.loc[ts] = 0
-                    continue
-
-                if position == 0:
-                    if self._is_after_4pm_on_friday(ts):
-                        signal.loc[ts] = 0
-                        continue
-                    if (z_val < -self.zs_entry_threshold) and (resid_val < -entry_th):
-                        position = 1
-                    elif (z_val > self.zs_entry_threshold) and (resid_val > entry_th):
-                        position = -1
-                elif position == 1:
-                    if z_val > -self.zs_exit_threshold:
-                        position = 0
-                elif position == -1:
-                    if z_val < self.zs_exit_threshold:
-                        position = 0
-
-                signal.loc[ts] = position
+            signal = self._generate_pair_signal_series(z, cum_resid, ret_entry_threshold)
 
             signals[pair] = signal
 
@@ -550,4 +566,77 @@ class FactorMeanReversionStrategy(Strategy):
             signals[pair] = signals.get(pair, pd.Series(0, index=rets.index)).add(
                 hedge_series, fill_value=0.0
             )
+        return signals
+
+    def generate_signals3(self) -> dict[str, pd.Series]:
+
+        factor_pca_rolling_lookback = pd.Timedelta(days=60)
+        spread_rolling_lookback = pd.Timedelta(minutes=30)
+        return_bucket_length = pd.Timedelta(hours=6)
+        calc_freq = pd.Timedelta(days=7)
+
+        rets = self.compute_mid_returns()
+        factor = self.compute_principal_factor(
+            rets,
+            method="rolling_pca",
+            window=factor_pca_rolling_lookback,
+            return_bucket_length=return_bucket_length,
+            calc_freq=calc_freq,
+            n_components=self.n_components,
+        )
+
+        raw_signals: dict[str, pd.Series] = {}
+        beta_by_pair: dict[str, pd.DataFrame] = {}
+
+        for pair in self.instruments:
+            beta, residuals = self.rolling_regression(
+                rets[pair],
+                factor,
+                window=factor_pca_rolling_lookback,
+                return_bucket_length=return_bucket_length,
+                calc_freq=calc_freq,
+            )
+
+            cum_resid = residuals.rolling(window=self.residual_rolling_lookback).sum()
+            mean = cum_resid.rolling(window=factor_pca_rolling_lookback).mean()
+            std = cum_resid.rolling(window=factor_pca_rolling_lookback).std()
+            z = (cum_resid - mean) / std
+
+            pair_df = self.close_price_dict[pair]
+            spread_ret = ((pair_df["ask"] - pair_df["bid"]) / pair_df["mid"]).replace(
+                [np.inf, -np.inf], np.nan
+            )
+            ret_entry_threshold = (
+                spread_ret.rolling(window=spread_rolling_lookback).mean()
+                * self.spread_entry_multiplier
+            ).reindex(z.index)
+
+            raw_signals[pair] = self._generate_pair_signal_series(
+                z, cum_resid, ret_entry_threshold
+            ).astype(float)
+            beta_by_pair[pair] = beta.reindex(rets.index)
+
+        raw_signal_df = pd.DataFrame(raw_signals, index=rets.index).fillna(0.0)
+        signals = {
+            pair: pd.Series(0.0, index=rets.index, dtype=float)
+            for pair in self.instruments
+        }
+
+        for ts in rets.index:
+            raw_weights = raw_signal_df.loc[ts, list(self.instruments)]
+            beta_matrix = pd.DataFrame(
+                {
+                    pair: beta_by_pair[pair].loc[ts]
+                    for pair in self.instruments
+                }
+            ).T
+            beta_matrix = beta_matrix.reindex(index=list(self.instruments))
+
+            neutral_weights = self._factor_neutralize_pair_weights(
+                raw_weights, beta_matrix
+            )
+
+            for pair in self.instruments:
+                signals[pair].loc[ts] = neutral_weights.loc[pair]
+
         return signals

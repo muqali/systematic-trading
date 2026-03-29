@@ -428,11 +428,6 @@ class FactorMeanReversionStrategy(Strategy):
         factor_projection = B @ (np.linalg.pinv(gram) @ (B.T @ s))
         projected = s - factor_projection
 
-        raw_gross = np.abs(s).sum()
-        projected_gross = np.abs(projected).sum()
-        if projected_gross > 0 and raw_gross > 0:
-            projected = projected * (raw_gross / projected_gross)
-
         projected[np.abs(projected) < 1e-10] = 0.0
         neutral_weights.loc[active] = projected
 

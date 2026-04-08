@@ -1,0 +1,174 @@
+from strategy.strategy import Strategy
+
+import pandas as pd
+
+
+class AmenStrategy(Strategy):
+    def __init__(
+        self,
+        traded_instruments: tuple[str],
+        fx_price_dict: dict[str, pd.DataFrame],
+        equity_close_dict: dict[str, pd.DataFrame],
+        bond_close_dict: dict[str, pd.DataFrame],
+    ):
+        self.instruments = traded_instruments
+        self.fx_price_dict = fx_price_dict
+        self.equity_close_dict = equity_close_dict
+        self.bond_close_dict = bond_close_dict
+
+    @staticmethod
+    def _month_end_time(period: pd.Period) -> pd.Timestamp:
+        month_end_date = period.asfreq("D", how="end").to_timestamp()
+        while month_end_date.dayofweek >= 5:
+            month_end_date -= pd.Timedelta(days=1)
+        return pd.Timestamp(
+            month_end_date.year,
+            month_end_date.month,
+            month_end_date.day,
+            11,
+            tz="US/Eastern",
+        )
+
+    @staticmethod
+    def _asof_index_and_value(
+        prices: pd.Series, ts: pd.Timestamp
+    ) -> tuple[pd.Timestamp, float] | tuple[None, None]:
+        pos = prices.index.searchsorted(ts, side="right") - 1
+        if pos < 0:
+            return None, None
+        return prices.index[pos], prices.iloc[pos]
+
+    def create_month_end_fx_returns(
+        self, time_offset_from_month_end: pd.Timedelta = pd.Timedelta(days=1)
+    ) -> dict[str, pd.Series]:
+        time_offset_from_month_end = pd.Timedelta(time_offset_from_month_end)
+        if time_offset_from_month_end < pd.Timedelta(0):
+            raise ValueError("time_offset_from_month_end must be non-negative.")
+
+        fx_returns = {}
+
+        for instrument in self.instruments:
+            if instrument not in self.fx_price_dict:
+                raise ValueError(f"Missing fx data for instrument '{instrument}'.")
+
+            df = self.fx_price_dict[instrument]
+            if "mid" not in df.columns:
+                raise ValueError(
+                    f"Expected a 'mid' column for fx instrument '{instrument}'."
+                )
+
+            prices = df["mid"].dropna().sort_index()
+            prices = prices[~prices.index.duplicated(keep="last")]
+            if prices.empty:
+                fx_returns[instrument] = pd.Series(dtype=float, name=instrument)
+                continue
+
+            months = prices.index.tz_localize(None).to_period("M").unique().sort_values()
+            monthly_rows = []
+
+            for month in months:
+                end_ts = self._month_end_time(month)
+                start_ts = end_ts - time_offset_from_month_end
+
+                _, start_price = self._asof_index_and_value(prices, start_ts)
+                _, end_price = self._asof_index_and_value(prices, end_ts)
+
+                if start_price is None or end_price is None:
+                    continue
+
+                monthly_rows.append(
+                    {"timestamp": start_ts, instrument: end_price / start_price - 1}
+                )
+
+            if not monthly_rows:
+                fx_returns[instrument] = pd.Series(dtype=float, name=instrument)
+                continue
+
+            instrument_returns = pd.DataFrame(monthly_rows).set_index("timestamp")[
+                instrument
+            ]
+            instrument_returns.name = instrument
+            fx_returns[instrument] = instrument_returns.sort_index()
+
+        return fx_returns
+
+    def create_monthly_asset_returns(
+        self, time_offset_from_month_end: pd.Timedelta = pd.Timedelta(days=1)
+    ) -> pd.DataFrame:
+        time_offset_from_month_end = pd.Timedelta(time_offset_from_month_end)
+        if time_offset_from_month_end < pd.Timedelta(0):
+            raise ValueError("time_offset_from_month_end must be non-negative.")
+
+        def build_asset_returns(
+            close_dict: dict[str, pd.DataFrame], asset_name: str
+        ) -> pd.DataFrame:
+            asset_returns = {}
+
+            for ccy, df in close_dict.items():
+                if "close" not in df.columns:
+                    raise ValueError(
+                        f"Expected a 'close' column for {asset_name} {ccy} data."
+                    )
+
+                close = df["close"].dropna().sort_index()
+                close = close[~close.index.duplicated(keep="last")]
+                if close.empty:
+                    continue
+
+                monthly_rows = []
+                month_periods = close.index.tz_localize(None).to_period("M")
+                months = month_periods.unique().sort_values()
+
+                for i in range(1, len(months)):
+                    prev_month = months[i - 1]
+                    month = months[i]
+
+                    target_ts = self._month_end_time(month) - time_offset_from_month_end
+
+                    target_value_ts, target_close = self._asof_index_and_value(
+                        close, target_ts
+                    )
+                    prev_month_close = close[month_periods == prev_month]
+
+                    if prev_month_close.empty or target_close is None:
+                        continue
+
+                    prev_close = prev_month_close.iloc[-1]
+                    if target_value_ts.tz_localize(None).to_period("M") != month:
+                        continue
+
+                    monthly_rows.append(
+                        {
+                            "timestamp": target_ts,
+                            f"{asset_name}_{ccy}": target_close / prev_close - 1,
+                        }
+                    )
+
+                if not monthly_rows:
+                    continue
+
+                ccy_returns = pd.DataFrame(monthly_rows).set_index("timestamp")
+
+                if not ccy_returns.empty:
+                    asset_returns[f"{asset_name}_{ccy}"] = ccy_returns.iloc[:, 0]
+
+            if not asset_returns:
+                return pd.DataFrame()
+
+            return pd.DataFrame(asset_returns).sort_index()
+
+        equity_returns = build_asset_returns(self.equity_close_dict, "equity")
+        bond_returns = build_asset_returns(self.bond_close_dict, "bond")
+
+        if equity_returns.empty:
+            return bond_returns
+        if bond_returns.empty:
+            return equity_returns
+
+        return pd.concat([equity_returns, bond_returns], axis=1).sort_index()
+
+    def generate_signals(self, data):
+
+        signals = []
+
+        return signals

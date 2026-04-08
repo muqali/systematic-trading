@@ -1,8 +1,13 @@
 import datetime as dt
+import os
 import pandas as pd
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor
 
 CSV_DATA_DIR = Path.home() / "Programming" / "data" / "tickquote"
+TIMESTAMP_FORMAT = "%Y%m%d %H%M%S%f"
+SOURCE_TIMEZONE = "EST"
+TARGET_TIMEZONE = "US/Eastern"
 
 
 def locate_files(ccy_pair: str, start_date: dt.date, end_date: dt.date) -> list[Path]:
@@ -23,6 +28,27 @@ def locate_files(ccy_pair: str, start_date: dt.date, end_date: dt.date) -> list[
         )
 
     return paths
+
+
+def _read_tick_quote_file(path: Path) -> pd.DataFrame:
+    df = pd.read_csv(
+        path,
+        usecols=[0, 1, 2],
+        names=["timestamp", "bid", "ask"],
+        header=None,
+        dtype={"timestamp": "string", "bid": "float64", "ask": "float64"},
+    )
+
+    df["timestamp"] = pd.to_datetime(
+        df["timestamp"], format=TIMESTAMP_FORMAT, errors="coerce"
+    )
+    df = df.dropna(subset=["timestamp"]).set_index("timestamp")
+    if df.empty:
+        return df
+
+    df.index = df.index.tz_localize(SOURCE_TIMEZONE).tz_convert(TARGET_TIMEZONE)
+    df["mid"] = (df["bid"] + df["ask"]) / 2
+    return df
 
 
 def _get_tick_quote_generator(ccy_pair: str, start_date: dt.date, end_date: dt.date):
@@ -50,18 +76,10 @@ def _get_tick_quote_generator(ccy_pair: str, start_date: dt.date, end_date: dt.d
     file_paths = locate_files(ccy_pair, start_date, end_date)
 
     for path in file_paths:
-        df = pd.read_csv(
-            path,
-            usecols=[0, 1, 2],
-            names=["timestamp", "bid", "ask"],
-            header=None,
-            index_col=0,
-            parse_dates=True,
-            date_format="%Y%m%d %H%M%S%f",
-        )
+        df = _read_tick_quote_file(path)
+        if df.empty:
+            continue
 
-        df = df.tz_localize("EST").tz_convert("US/Eastern")
-        df["mid"] = (df["bid"] + df["ask"]) / 2
         yield df
 
 
@@ -87,10 +105,26 @@ def get_tick_quote(
 
 
 def get_tick_quotes(
-    ccy_pairs: list[str], start_date: dt.date, end_date: dt.date
+    ccy_pairs: list[str],
+    start_date: dt.date,
+    end_date: dt.date,
+    max_workers: int | None = None,
 ) -> dict[str, pd.DataFrame]:
+    if len(ccy_pairs) <= 1:
+        return {
+            ccy_pair: get_tick_quote(ccy_pair, start_date, end_date)
+            for ccy_pair in ccy_pairs
+        }
 
-    return {
-        ccy_pair: get_tick_quote(ccy_pair, start_date, end_date)
-        for ccy_pair in ccy_pairs
-    }
+    if max_workers is None:
+        max_workers = min(len(ccy_pairs), max(1, min(4, os.cpu_count() or 1)))
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        results = executor.map(
+            lambda ccy_pair: (
+                ccy_pair,
+                get_tick_quote(ccy_pair, start_date, end_date),
+            ),
+            ccy_pairs,
+        )
+        return {ccy_pair: df for ccy_pair, df in results}

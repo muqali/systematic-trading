@@ -1,8 +1,9 @@
 import datetime as dt
+import os
 import pandas as pd
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
-from data.tick_data_loader import get_tick_quote
+from data.tick_data_loader import locate_files as locate_tick_files
 
 
 CSV_DATA_DIR = Path.home() / "Programming" / "data" / "minutebar"
@@ -101,24 +102,57 @@ def get_minute_bars(
 def get_minute_quote(
     ccy_pair: str, start_date: dt.date, end_date: dt.date
 ) -> pd.DataFrame:
-    df = get_tick_quote(ccy_pair, start_date, end_date)
+    load_start = start_date - dt.timedelta(days=1)
+    start_dt = pd.Timestamp(
+        start_date.year, start_date.month, start_date.day, 17, tz="US/Eastern"
+    ) - pd.Timedelta(days=1)
+    end_dt = pd.Timestamp(
+        end_date.year, end_date.month, end_date.day, 17, tz="US/Eastern"
+    )
 
-    # We only need minute-close quotes, so use last() instead of ohlc().
-    df = df[["bid", "ask", "mid"]].resample("1min", label="right", closed="right").last()
-    if df.empty:
-        return df
+    minute_frames = []
+    file_paths = locate_tick_files(ccy_pair, load_start, end_date)
 
-    full = pd.date_range(start=df.index.min(), end=df.index.max(), freq="1min")
+    for path in file_paths:
+        df = pd.read_csv(
+            path,
+            usecols=[0, 1, 2],
+            names=["timestamp", "bid", "ask"],
+            header=None,
+            dtype={"timestamp": "string", "bid": "float64", "ask": "float64"},
+        )
 
-    mask = (
+        df["timestamp"] = pd.to_datetime(
+            df["timestamp"], format="%Y%m%d %H%M%S%f", errors="coerce"
+        )
+        df = df.dropna(subset=["timestamp"]).set_index("timestamp")
+        if df.empty:
+            continue
+
+        df.index = df.index.tz_localize("EST").tz_convert("US/Eastern")
+
+        minute_df = df.resample("1min", label="right", closed="right").last()
+        minute_df = minute_df.loc[(minute_df.index >= start_dt) & (minute_df.index < end_dt)]
+        if minute_df.empty:
+            continue
+
+        minute_df["mid"] = (minute_df["bid"] + minute_df["ask"]) / 2
+        minute_frames.append(minute_df)
+
+    if not minute_frames:
+        return pd.DataFrame(columns=["bid", "ask", "mid"])
+
+    df = pd.concat(minute_frames).sort_index()
+    df = df[~df.index.duplicated(keep="last")]
+
+    full = pd.date_range(start=df.index.min(), end=df.index.max(), freq="1min", tz="US/Eastern")
+    trading_mask = (
         (full.dayofweek < 4)
         | ((full.dayofweek == 4) & (full.hour < 17))
         | ((full.dayofweek == 6) & (full.hour >= 18))
     )
 
-    full = full[mask]
-
-    df = df.reindex(full)
+    df = df.reindex(full[trading_mask])
 
     return df.ffill(limit=10)
 
@@ -134,6 +168,9 @@ def get_minute_quotes(
             ccy_pair: get_minute_quote(ccy_pair, start_date, end_date)
             for ccy_pair in ccy_pairs
         }
+
+    if max_workers is None:
+        max_workers = min(len(ccy_pairs), max(1, min(4, os.cpu_count() or 1)))
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         results = executor.map(

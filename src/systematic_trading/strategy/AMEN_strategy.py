@@ -38,6 +38,36 @@ class AmenStrategy(Strategy):
             return None, None
         return prices.index[pos], prices.iloc[pos]
 
+    @staticmethod
+    def _subtract_weekend_excluding_offset(
+        ts: pd.Timestamp, offset: pd.Timedelta
+    ) -> pd.Timestamp:
+        current = pd.Timestamp(ts)
+        remaining = pd.Timedelta(offset)
+
+        while remaining > pd.Timedelta(0):
+            saturday_start = current.normalize() - pd.Timedelta(
+                days=max(current.dayofweek - 5, 0)
+            )
+            if current.dayofweek == 6 or (
+                current.dayofweek == 5 and current != saturday_start
+            ):
+                current = saturday_start
+                continue
+
+            business_week_start = current.normalize() - pd.Timedelta(
+                days=min(current.dayofweek, 5)
+            )
+            available = current - business_week_start
+
+            if remaining <= available:
+                return current - remaining
+
+            remaining -= available
+            current = business_week_start - pd.Timedelta(days=2)
+
+        return current
+
     def create_month_end_fx_returns(
         self, time_offset_from_month_end: pd.Timedelta = pd.Timedelta(days=1)
     ) -> dict[str, pd.Series]:
@@ -68,7 +98,9 @@ class AmenStrategy(Strategy):
 
             for month in months:
                 end_ts = self._month_end_time(month)
-                start_ts = end_ts - time_offset_from_month_end
+                start_ts = self._subtract_weekend_excluding_offset(
+                    end_ts, time_offset_from_month_end
+                )
 
                 _, start_price = self._asof_index_and_value(prices, start_ts)
                 _, end_price = self._asof_index_and_value(prices, end_ts)
@@ -123,7 +155,9 @@ class AmenStrategy(Strategy):
                     prev_month = months[i - 1]
                     month = months[i]
 
-                    target_ts = self._month_end_time(month) - time_offset_from_month_end
+                    target_ts = self._subtract_weekend_excluding_offset(
+                        self._month_end_time(month), time_offset_from_month_end
+                    )
 
                     target_value_ts, target_close = self._asof_index_and_value(
                         close, target_ts

@@ -40,13 +40,13 @@ def _calculate_window_return(
 ) -> pd.Series:
     if start_time < end_time:
         intraday = price_series[
-            (price_series.index.time > start_time)
+            (price_series.index.time >= start_time)
             & (price_series.index.time <= end_time)
         ]
         group_keys = intraday.index.normalize()
     else:
         intraday = price_series[
-            (price_series.index.time > start_time)
+            (price_series.index.time >= start_time)
             | (price_series.index.time <= end_time)
         ]
         # Shift timestamps after midnight back one day so (23:00, 00:00]

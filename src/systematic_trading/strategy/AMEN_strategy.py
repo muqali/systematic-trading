@@ -1,5 +1,6 @@
 from strategy.strategy import Strategy
 
+import math
 from pathlib import Path
 import pandas as pd
 import statsmodels.api as sm
@@ -270,6 +271,23 @@ class AmenStrategy(Strategy):
                 X_current = combined.loc[[prediction_ts], asset_columns].astype(float)
                 predicted_return = float(model.predict(X_current).iloc[0])
                 realized_fx_return = float(combined.loc[prediction_ts, instrument])
+                history_predicted_returns = pd.Series(
+                    model.predict(X_train), index=history.index
+                )
+                absolute_predictions = pd.concat(
+                    [
+                        history_predicted_returns.abs(),
+                        pd.Series([abs(predicted_return)], index=[prediction_ts]),
+                    ]
+                )
+                absolute_prediction_rank = int(
+                    absolute_predictions.rank(
+                        method="min", ascending=False
+                    ).loc[prediction_ts]
+                )
+                keep_signal = absolute_prediction_rank <= math.ceil(
+                    len(absolute_predictions) / 3
+                )
 
                 month_end_ts = self._month_end_time(
                     prediction_ts.tz_localize(None).to_period("M")
@@ -283,6 +301,8 @@ class AmenStrategy(Strategy):
                     "adj_r_squared": float(model.rsquared_adj),
                     "predicted_return": predicted_return,
                     "realized_fx_return": realized_fx_return,
+                    "absolute_prediction_rank": absolute_prediction_rank,
+                    "signal_kept": keep_signal,
                 }
                 regression_row.update(
                     {
@@ -293,7 +313,7 @@ class AmenStrategy(Strategy):
                 regression_rows.append(regression_row)
                 signal.loc[
                     (signal.index >= prediction_ts) & (signal.index < month_end_ts)
-                ] = predicted_return
+                ] = predicted_return if keep_signal else 0.0
 
             signals[instrument] = signal
 

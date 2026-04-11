@@ -21,6 +21,16 @@ class AmenStrategy(Strategy):
         look_back_months = hyper_param_dict.get("look_back_months", 60)
         if look_back_months <= 0:
             raise ValueError("look_back_months must be positive.")
+        prediction_rank_threshold = hyper_param_dict.get(
+            "prediction_rank_threshold", 1 / 3
+        )
+        if not 0 < prediction_rank_threshold <= 1:
+            raise ValueError("prediction_rank_threshold must be in (0, 1].")
+        prediction_zscore_threshold = hyper_param_dict.get(
+            "prediction_zscore_threshold", 0.0
+        )
+        if prediction_zscore_threshold < 0:
+            raise ValueError("prediction_zscore_threshold must be non-negative.")
 
         self.instruments = traded_instruments
         self.fx_price_dict = fx_price_dict
@@ -32,6 +42,8 @@ class AmenStrategy(Strategy):
             )
         )
         self.look_back_months = look_back_months
+        self.prediction_rank_threshold = float(prediction_rank_threshold)
+        self.prediction_zscore_threshold = float(prediction_zscore_threshold)
         self.regression_log_path = Path(
             hyper_param_dict.get(
                 "regression_log_path", "amen_regression_diagnostics.csv"
@@ -285,8 +297,24 @@ class AmenStrategy(Strategy):
                         method="min", ascending=False
                     ).loc[prediction_ts]
                 )
-                keep_signal = absolute_prediction_rank <= math.ceil(
-                    len(absolute_predictions) / 3
+                rank_cutoff = math.ceil(
+                    len(absolute_predictions) * self.prediction_rank_threshold
+                )
+                history_prediction_mean = float(history_predicted_returns.mean())
+                history_prediction_std = float(history_predicted_returns.std())
+                if pd.isna(history_prediction_std) or history_prediction_std == 0.0:
+                    prediction_zscore = (
+                        0.0
+                        if predicted_return == history_prediction_mean
+                        else float("inf")
+                    )
+                else:
+                    prediction_zscore = (
+                        predicted_return - history_prediction_mean
+                    ) / history_prediction_std
+                keep_signal = absolute_prediction_rank <= rank_cutoff
+                keep_signal = keep_signal and (
+                    abs(prediction_zscore) >= self.prediction_zscore_threshold
                 )
 
                 month_end_ts = self._month_end_time(
@@ -302,6 +330,10 @@ class AmenStrategy(Strategy):
                     "predicted_return": predicted_return,
                     "realized_fx_return": realized_fx_return,
                     "absolute_prediction_rank": absolute_prediction_rank,
+                    "rank_cutoff": rank_cutoff,
+                    "prediction_zscore": float(prediction_zscore),
+                    "prediction_rank_threshold": self.prediction_rank_threshold,
+                    "prediction_zscore_threshold": self.prediction_zscore_threshold,
                     "signal_kept": keep_signal,
                 }
                 regression_row.update(

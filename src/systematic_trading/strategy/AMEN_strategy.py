@@ -31,6 +31,7 @@ class AmenStrategy(Strategy):
         )
         if prediction_zscore_threshold < 0:
             raise ValueError("prediction_zscore_threshold must be non-negative.")
+        use_all_countries = hyper_param_dict.get("use_all_countries", True)
 
         self.instruments = traded_instruments
         self.fx_price_dict = fx_price_dict
@@ -44,6 +45,7 @@ class AmenStrategy(Strategy):
         self.look_back_months = look_back_months
         self.prediction_rank_threshold = float(prediction_rank_threshold)
         self.prediction_zscore_threshold = float(prediction_zscore_threshold)
+        self.use_all_countries = bool(use_all_countries)
         self.regression_log_path = Path(
             hyper_param_dict.get(
                 "regression_log_path", "amen_regression_diagnostics.csv"
@@ -101,6 +103,28 @@ class AmenStrategy(Strategy):
             current = business_week_start - pd.Timedelta(days=2)
 
         return current
+
+    @staticmethod
+    def _instrument_currencies(instrument: str) -> tuple[str, str]:
+        if len(instrument) < 6:
+            raise ValueError(
+                f"Cannot infer base and term currencies from instrument '{instrument}'."
+            )
+        return instrument[:3].upper(), instrument[3:6].upper()
+
+    def _asset_columns_for_instrument(
+        self, instrument: str, asset_columns: list[str]
+    ) -> list[str]:
+        if self.use_all_countries:
+            return asset_columns
+
+        base_ccy, term_ccy = self._instrument_currencies(instrument)
+        relevant_ccys = {base_ccy, term_ccy}
+        return [
+            column
+            for column in asset_columns
+            if column.rsplit("_", maxsplit=1)[-1].upper() in relevant_ccys
+        ]
 
     def create_month_end_fx_returns(
         self, time_offset_from_month_end: pd.Timedelta = pd.Timedelta(days=1)
@@ -254,13 +278,23 @@ class AmenStrategy(Strategy):
 
             signal = pd.Series(0.0, index=price_df.sort_index().index, name=instrument)
             fx_forward_return = fx_forward_return_dict.get(instrument)
+            selected_asset_columns = self._asset_columns_for_instrument(
+                instrument, asset_columns
+            )
 
-            if fx_forward_return is None or fx_forward_return.empty or not asset_columns:
+            if (
+                fx_forward_return is None
+                or fx_forward_return.empty
+                or not selected_asset_columns
+            ):
                 signals[instrument] = signal
                 continue
 
             combined = pd.concat(
-                [fx_forward_return.rename(instrument), asset_past_return],
+                [
+                    fx_forward_return.rename(instrument),
+                    asset_past_return[selected_asset_columns],
+                ],
                 axis=1,
                 join="inner",
             ).dropna()
@@ -277,10 +311,12 @@ class AmenStrategy(Strategy):
                     continue
 
                 y_train = history[instrument].astype(float)
-                X_train = history[asset_columns].astype(float)
+                X_train = history[selected_asset_columns].astype(float)
                 model = sm.OLS(y_train, X_train).fit()
 
-                X_current = combined.loc[[prediction_ts], asset_columns].astype(float)
+                X_current = combined.loc[[prediction_ts], selected_asset_columns].astype(
+                    float
+                )
                 predicted_return = float(model.predict(X_current).iloc[0])
                 realized_fx_return = float(combined.loc[prediction_ts, instrument])
                 history_predicted_returns = pd.Series(
@@ -334,12 +370,14 @@ class AmenStrategy(Strategy):
                     "prediction_zscore": float(prediction_zscore),
                     "prediction_rank_threshold": self.prediction_rank_threshold,
                     "prediction_zscore_threshold": self.prediction_zscore_threshold,
+                    "use_all_countries": self.use_all_countries,
+                    "regressor_columns": ",".join(selected_asset_columns),
                     "signal_kept": keep_signal,
                 }
                 regression_row.update(
                     {
                         f"coef_{column}": float(model.params.get(column, float("nan")))
-                        for column in asset_columns
+                        for column in selected_asset_columns
                     }
                 )
                 regression_rows.append(regression_row)

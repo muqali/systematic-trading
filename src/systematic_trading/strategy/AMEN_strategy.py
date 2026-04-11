@@ -1,6 +1,7 @@
 from strategy.strategy import Strategy
 
 import pandas as pd
+import statsmodels.api as sm
 
 
 class AmenStrategy(Strategy):
@@ -10,11 +11,17 @@ class AmenStrategy(Strategy):
         fx_price_dict: dict[str, pd.DataFrame],
         equity_close_dict: dict[str, pd.DataFrame],
         bond_close_dict: dict[str, pd.DataFrame],
+        hyper_param_dict = {
+            "time_offset_from_month_end": pd.Timedelta(days=1),
+            "look_back_months": 60,
+        },
     ):
         self.instruments = traded_instruments
         self.fx_price_dict = fx_price_dict
         self.equity_close_dict = equity_close_dict
         self.bond_close_dict = bond_close_dict
+        self.time_offset_from_month_end = hyper_param_dict.get("time_offset_from_month_end", pd.Timedelta(days=1))
+        self.look_back_months = hyper_param_dict.get("look_back_months", 12)
 
     @staticmethod
     def _month_end_time(period: pd.Period) -> pd.Timestamp:
@@ -201,8 +208,70 @@ class AmenStrategy(Strategy):
 
         return pd.concat([equity_returns, bond_returns], axis=1).sort_index()
 
-    def generate_signals(self, data):
+    def generate_signals(
+        self,
+        look_back_months: int = 12,
+        time_offset_from_month_end: pd.Timedelta = pd.Timedelta(days=1),
+    ) -> dict[str, pd.Series]:
+        if look_back_months <= 0:
+            raise ValueError("look_back_months must be positive.")
 
-        signals = []
+        asset_past_return = self.create_monthly_asset_returns(time_offset_from_month_end)
+        fx_forward_return_dict = self.create_month_end_fx_returns(
+            time_offset_from_month_end
+        )
+
+        signals: dict[str, pd.Series] = {}
+        asset_columns = list(asset_past_return.columns)
+
+        for instrument in self.instruments:
+            price_df = self.fx_price_dict.get(instrument)
+            if price_df is None:
+                raise ValueError(f"Missing fx data for instrument '{instrument}'.")
+
+            signal = pd.Series(0.0, index=price_df.sort_index().index, name=instrument)
+            fx_forward_return = fx_forward_return_dict.get(instrument)
+
+            if fx_forward_return is None or fx_forward_return.empty or not asset_columns:
+                signals[instrument] = signal
+                continue
+
+            combined = pd.concat(
+                [fx_forward_return.rename(instrument), asset_past_return],
+                axis=1,
+                join="inner",
+            ).dropna()
+
+            if combined.empty:
+                signals[instrument] = signal
+                continue
+
+            for prediction_ts in combined.index:
+                history = combined.loc[combined.index < prediction_ts].tail(
+                    look_back_months
+                )
+                if len(history) < look_back_months:
+                    continue
+
+                y_train = history[instrument].astype(float)
+                X_train = sm.add_constant(
+                    history[asset_columns].astype(float), has_constant="add"
+                )
+                model = sm.OLS(y_train, X_train).fit()
+
+                X_current = sm.add_constant(
+                    combined.loc[[prediction_ts], asset_columns].astype(float),
+                    has_constant="add",
+                ).reindex(columns=X_train.columns)
+                predicted_return = float(model.predict(X_current).iloc[0])
+
+                month_end_ts = self._month_end_time(
+                    prediction_ts.tz_localize(None).to_period("M")
+                )
+                signal.loc[
+                    (signal.index >= prediction_ts) & (signal.index < month_end_ts)
+                ] = predicted_return
+
+            signals[instrument] = signal
 
         return signals

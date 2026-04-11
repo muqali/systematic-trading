@@ -1,10 +1,8 @@
 from strategy.strategy import Strategy
 
-import logging
+from pathlib import Path
 import pandas as pd
 import statsmodels.api as sm
-
-logger = logging.getLogger(__name__)
 
 
 class AmenStrategy(Strategy):
@@ -33,6 +31,11 @@ class AmenStrategy(Strategy):
             )
         )
         self.look_back_months = look_back_months
+        self.regression_log_path = Path(
+            hyper_param_dict.get(
+                "regression_log_path", "amen_regression_diagnostics.csv"
+            )
+        )
 
     @staticmethod
     def _month_end_time(period: pd.Period) -> pd.Timestamp:
@@ -229,6 +232,7 @@ class AmenStrategy(Strategy):
 
         signals: dict[str, pd.Series] = {}
         asset_columns = list(asset_past_return.columns)
+        regression_rows: list[dict[str, float | int | str]] = []
 
         for instrument in self.instruments:
             price_df = self.fx_price_dict.get(instrument)
@@ -262,29 +266,37 @@ class AmenStrategy(Strategy):
                 y_train = history[instrument].astype(float)
                 X_train = history[asset_columns].astype(float)
                 model = sm.OLS(y_train, X_train).fit()
-                logger.info(
-                    (
-                        "AMEN regression instrument=%s prediction_ts=%s "
-                        "n_obs=%d coefficients=%s r_squared=%.6f adj_r_squared=%.6f"
-                    ),
-                    instrument,
-                    prediction_ts.isoformat(),
-                    len(history),
-                    model.params.to_dict(),
-                    model.rsquared,
-                    model.rsquared_adj,
-                )
 
                 X_current = combined.loc[[prediction_ts], asset_columns].astype(float)
                 predicted_return = float(model.predict(X_current).iloc[0])
+                realized_fx_return = float(combined.loc[prediction_ts, instrument])
 
                 month_end_ts = self._month_end_time(
                     prediction_ts.tz_localize(None).to_period("M")
                 )
+                regression_row = {
+                    "instrument": instrument,
+                    "prediction_ts": prediction_ts.isoformat(),
+                    "month_end_ts": month_end_ts.isoformat(),
+                    "n_obs": len(history),
+                    "r_squared": float(model.rsquared),
+                    "adj_r_squared": float(model.rsquared_adj),
+                    "predicted_return": predicted_return,
+                    "realized_fx_return": realized_fx_return,
+                }
+                regression_row.update(
+                    {
+                        f"coef_{column}": float(model.params.get(column, float("nan")))
+                        for column in asset_columns
+                    }
+                )
+                regression_rows.append(regression_row)
                 signal.loc[
                     (signal.index >= prediction_ts) & (signal.index < month_end_ts)
                 ] = predicted_return
 
             signals[instrument] = signal
+
+        pd.DataFrame(regression_rows).to_csv(self.regression_log_path, index=False)
 
         return signals

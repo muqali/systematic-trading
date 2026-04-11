@@ -1,7 +1,10 @@
 from strategy.strategy import Strategy
 
+import logging
 import pandas as pd
 import statsmodels.api as sm
+
+logger = logging.getLogger(__name__)
 
 
 class AmenStrategy(Strategy):
@@ -11,17 +14,25 @@ class AmenStrategy(Strategy):
         fx_price_dict: dict[str, pd.DataFrame],
         equity_close_dict: dict[str, pd.DataFrame],
         bond_close_dict: dict[str, pd.DataFrame],
-        hyper_param_dict = {
-            "time_offset_from_month_end": pd.Timedelta(days=1),
-            "look_back_months": 60,
-        },
+        hyper_param_dict: dict | None = None,
     ):
+        if hyper_param_dict is None:
+            hyper_param_dict = {}
+
+        look_back_months = hyper_param_dict.get("look_back_months", 60)
+        if look_back_months <= 0:
+            raise ValueError("look_back_months must be positive.")
+
         self.instruments = traded_instruments
         self.fx_price_dict = fx_price_dict
         self.equity_close_dict = equity_close_dict
         self.bond_close_dict = bond_close_dict
-        self.time_offset_from_month_end = hyper_param_dict.get("time_offset_from_month_end", pd.Timedelta(days=1))
-        self.look_back_months = hyper_param_dict.get("look_back_months", 12)
+        self.time_offset_from_month_end = pd.Timedelta(
+            hyper_param_dict.get(
+                "time_offset_from_month_end", pd.Timedelta(days=1)
+            )
+        )
+        self.look_back_months = look_back_months
 
     @staticmethod
     def _month_end_time(period: pd.Period) -> pd.Timestamp:
@@ -208,17 +219,12 @@ class AmenStrategy(Strategy):
 
         return pd.concat([equity_returns, bond_returns], axis=1).sort_index()
 
-    def generate_signals(
-        self,
-        look_back_months: int = 12,
-        time_offset_from_month_end: pd.Timedelta = pd.Timedelta(days=1),
-    ) -> dict[str, pd.Series]:
-        if look_back_months <= 0:
-            raise ValueError("look_back_months must be positive.")
-
-        asset_past_return = self.create_monthly_asset_returns(time_offset_from_month_end)
+    def generate_signals(self) -> dict[str, pd.Series]:
+        asset_past_return = self.create_monthly_asset_returns(
+            self.time_offset_from_month_end
+        )
         fx_forward_return_dict = self.create_month_end_fx_returns(
-            time_offset_from_month_end
+            self.time_offset_from_month_end
         )
 
         signals: dict[str, pd.Series] = {}
@@ -248,21 +254,28 @@ class AmenStrategy(Strategy):
 
             for prediction_ts in combined.index:
                 history = combined.loc[combined.index < prediction_ts].tail(
-                    look_back_months
+                    self.look_back_months
                 )
-                if len(history) < look_back_months:
+                if len(history) < self.look_back_months:
                     continue
 
                 y_train = history[instrument].astype(float)
-                X_train = sm.add_constant(
-                    history[asset_columns].astype(float), has_constant="add"
-                )
+                X_train = history[asset_columns].astype(float)
                 model = sm.OLS(y_train, X_train).fit()
+                logger.info(
+                    (
+                        "AMEN regression instrument=%s prediction_ts=%s "
+                        "n_obs=%d coefficients=%s r_squared=%.6f adj_r_squared=%.6f"
+                    ),
+                    instrument,
+                    prediction_ts.isoformat(),
+                    len(history),
+                    model.params.to_dict(),
+                    model.rsquared,
+                    model.rsquared_adj,
+                )
 
-                X_current = sm.add_constant(
-                    combined.loc[[prediction_ts], asset_columns].astype(float),
-                    has_constant="add",
-                ).reindex(columns=X_train.columns)
+                X_current = combined.loc[[prediction_ts], asset_columns].astype(float)
                 predicted_return = float(model.predict(X_current).iloc[0])
 
                 month_end_ts = self._month_end_time(

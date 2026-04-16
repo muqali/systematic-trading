@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from itertools import product
+from typing import Any
 from pathlib import Path
 from time import perf_counter
 import json
@@ -10,7 +11,7 @@ import math
 import pandas as pd
 
 from analytics.performance_report import PerformanceReport
-from strategy.strategy import OptimizableStrategyFactory, Strategy
+from strategy.strategy import OptimizableStrategyFactory
 from trading.aggressive_trader import AggressiveTrader
 
 
@@ -129,7 +130,7 @@ def _build_strategy(
     strategy_factory: OptimizableStrategyFactory,
     strategy_kwargs: dict,
     params: dict,
-) -> Strategy:
+) -> Any:
     try:
         strategy = strategy_factory(
             **strategy_kwargs,
@@ -141,8 +142,12 @@ def _build_strategy(
             "and a hyper_param_dict keyword argument."
         ) from exc
 
-    if not isinstance(strategy, Strategy):
-        raise TypeError("strategy_cls must construct an instance of Strategy.")
+    generate_signals = getattr(strategy, "generate_signals", None)
+    if not callable(generate_signals):
+        raise TypeError(
+            "strategy_cls must construct an object with a callable "
+            "generate_signals() method."
+        )
 
     return strategy
 

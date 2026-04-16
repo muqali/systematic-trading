@@ -10,7 +10,7 @@ import math
 import pandas as pd
 
 from analytics.performance_report import PerformanceReport
-from strategy.factor_mean_reversion_strategy import FactorMeanReversionStrategy
+from strategy.strategy import OptimizableStrategyFactory, Strategy
 from trading.aggressive_trader import AggressiveTrader
 
 
@@ -125,6 +125,28 @@ def _resolve_metric_name(
     )
 
 
+def _build_strategy(
+    strategy_factory: OptimizableStrategyFactory,
+    strategy_kwargs: dict,
+    params: dict,
+) -> Strategy:
+    try:
+        strategy = strategy_factory(
+            **strategy_kwargs,
+            hyper_param_dict=params,
+        )
+    except TypeError as exc:
+        raise TypeError(
+            "strategy_cls must be constructible with the supplied strategy_kwargs "
+            "and a hyper_param_dict keyword argument."
+        ) from exc
+
+    if not isinstance(strategy, Strategy):
+        raise TypeError("strategy_cls must construct an instance of Strategy.")
+
+    return strategy
+
+
 def _load_resume_state(
     instruments: list[str],
     log_path: Path,
@@ -219,7 +241,7 @@ def _load_resume_state(
 
 
 def optimize_strategy_hyperparams(
-    strategy_cls,
+    strategy_cls: OptimizableStrategyFactory,
     strategy_kwargs: dict,
     instruments: list[str],
     close_price_dict: dict[str, pd.DataFrame],
@@ -288,10 +310,7 @@ def optimize_strategy_hyperparams(
             if params_json in existing_signatures:
                 continue
 
-            strategy = strategy_cls(
-                **strategy_kwargs,
-                hyper_param_dict=params,
-            )
+            strategy = _build_strategy(strategy_cls, strategy_kwargs, params)
             signals = strategy.generate_signals()
 
             effective_trader_kwargs = dict(trader_kwargs)
@@ -378,30 +397,4 @@ def optimize_strategy_hyperparams(
         completed_trials=len(existing_signatures),
         elapsed_seconds=elapsed_seconds,
         log_path=log_path,
-    )
-
-
-def optimize_factor_mean_reversion_hyperparams(
-    instruments: list[str],
-    close_price_dict: dict[str, pd.DataFrame],
-    param_grid: dict[str, list],
-    log_path: str | Path = "src/systematic_trading/hyperparam_trials.csv",
-    checkpoint_every: int = 10,
-    resume: bool = True,
-    metric: str = "Sharpe_Net",
-) -> HyperParamOptimizationResult:
-    return optimize_strategy_hyperparams(
-        strategy_cls=FactorMeanReversionStrategy,
-        strategy_kwargs={
-            "instruments": tuple(instruments),
-            "close_price_dict": close_price_dict,
-        },
-        instruments=instruments,
-        close_price_dict=close_price_dict,
-        param_grid=param_grid,
-        trader_cls=AggressiveTrader,
-        metric=metric,
-        log_path=log_path,
-        checkpoint_every=checkpoint_every,
-        resume=resume,
     )

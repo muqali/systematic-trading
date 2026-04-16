@@ -1,8 +1,10 @@
 from strategy.strategy import Strategy
+from util.math_util import mad_clip
 
 import math
 from pathlib import Path
 import pandas as pd
+import numpy as np
 import statsmodels.api as sm
 
 
@@ -312,6 +314,9 @@ class AmenStrategy(Strategy):
 
                 y_train = history[instrument].astype(float)
                 X_train = history[selected_asset_columns].astype(float)
+
+                y_train = mad_clip(y_train, 2.0)
+                X_train = mad_clip(X_train, 2.0)
                 model = sm.OLS(y_train, X_train).fit()
 
                 X_current = combined.loc[[prediction_ts], selected_asset_columns].astype(
@@ -383,7 +388,7 @@ class AmenStrategy(Strategy):
                 regression_rows.append(regression_row)
                 signal.loc[
                     (signal.index >= prediction_ts) & (signal.index < month_end_ts)
-                ] = predicted_return if keep_signal else 0.0
+                ] = np.sign(prediction_zscore) if keep_signal else 0.0
 
             signals[instrument] = signal
 

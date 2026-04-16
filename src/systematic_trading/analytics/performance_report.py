@@ -6,6 +6,7 @@ from trading.trader import Trader
 
 
 class PerformanceReport:
+    PORTFOLIO_LABEL = "PORTFOLIO"
 
     def __init__(
         self,
@@ -33,6 +34,22 @@ class PerformanceReport:
         sharpe = (mean_ret / std_ret) * np.sqrt(252) if std_ret > 0 else np.nan
 
         return sharpe
+
+    def _to_daily_trade_count(self, trades: pd.DataFrame) -> pd.Series:
+        if trades.empty:
+            return pd.Series(dtype=float)
+
+        daily_trades = trades.copy()
+        daily_trades.index = daily_trades.index + pd.Timedelta(hours=7)
+        return daily_trades["trade_size"].resample("1D").count()
+
+    def _combine_series_dict(self, series_dict: dict[str, pd.Series]) -> pd.Series:
+        valid_series = [series for series in series_dict.values() if not series.empty]
+        if not valid_series:
+            return pd.Series(dtype=float)
+
+        combined = pd.concat(valid_series, axis=1).fillna(0.0)
+        return combined.sum(axis=1)
 
     def series_value_duration(self, input_series):
         """
@@ -85,9 +102,7 @@ class PerformanceReport:
         # ----------------------------------
         # Avg trades per day
         # ----------------------------------
-        daily_trades = trades.copy()
-        daily_trades.index = daily_trades.index + pd.Timedelta(hours=7)
-        daily_trades = trades["trade_size"].resample("1D").count()
+        daily_trades = self._to_daily_trade_count(trades)
         avg_trades = daily_trades.mean()
 
         # ----------------------------------
@@ -134,7 +149,54 @@ class PerformanceReport:
 
         return metrics
 
-    def generate_performance_report(self):
+    def get_portfolio_metrics(self):
+        net_pnl = self._combine_series_dict(self.net_pnl_dict)
+        gross_pnl = self._combine_series_dict(self.gross_pnl_dict)
+        daily_net_pnl = self.convert_to_daily_pnl(net_pnl)
+        daily_gross_pnl = self.convert_to_daily_pnl(gross_pnl)
+
+        trade_counts = [
+            self._to_daily_trade_count(trades)
+            for trades in self.trade_dict.values()
+            if not trades.empty
+        ]
+        if trade_counts:
+            daily_trade_count = pd.concat(trade_counts, axis=1).fillna(0.0).sum(axis=1)
+            avg_trades = daily_trade_count.mean()
+        else:
+            avg_trades = 0.0
+
+        total_trades = int(
+            sum(len(trades) for trades in self.trade_dict.values() if not trades.empty)
+        )
+        cumulative = net_pnl.cumsum()
+        peak = cumulative.cummax()
+        drawdown = cumulative - peak
+
+        metrics = {}
+        metrics["Sharpe_Net"] = self.calc_sharpe(daily_net_pnl)
+        metrics["Sharpe_Gross"] = self.calc_sharpe(daily_gross_pnl)
+        metrics["AvgTradesPerDay"] = avg_trades
+        metrics["MaxDrawdown"] = drawdown.min() if not drawdown.empty else np.nan
+        metrics["WorstDayPnL"] = daily_net_pnl.min() if not daily_net_pnl.empty else np.nan
+        metrics["AvgNetPnLPerTrade"] = (
+            net_pnl.sum() / total_trades if total_trades > 0 else 0.0
+        )
+        metrics["AvgGrossPnLPerTrade"] = (
+            gross_pnl.sum() / total_trades if total_trades > 0 else 0.0
+        )
+        metrics["AvgPosDur"] = np.nan
+        metrics["MedPosDur"] = np.nan
+        metrics["Q10PosDur"] = np.nan
+        metrics["Q90PosDur"] = np.nan
+
+        return metrics
+
+    def generate_performance_report(
+        self,
+        include_portfolio: bool = False,
+        portfolio_label: str = PORTFOLIO_LABEL,
+    ):
 
         report_dict = {}
 
@@ -144,6 +206,9 @@ class PerformanceReport:
 
         for instrument in self.instruments:
             report_dict[instrument] = self.get_instrument_metrics(instrument)
+
+        if include_portfolio:
+            report_dict[portfolio_label] = self.get_portfolio_metrics()
 
         report_df = pd.DataFrame(report_dict).T
 

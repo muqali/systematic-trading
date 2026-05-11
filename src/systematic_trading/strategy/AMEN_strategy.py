@@ -39,15 +39,28 @@ class AmenStrategy(Strategy):
         self.fx_price_dict = fx_price_dict
         self.equity_close_dict = equity_close_dict
         self.bond_close_dict = bond_close_dict
-        self.time_offset_from_month_end = pd.Timedelta(
+        self.entry_time_offset_from_month_end = pd.Timedelta(
             hyper_param_dict.get(
-                "time_offset_from_month_end", pd.Timedelta(days=1)
+                "entry_time_offset_from_month_end", pd.Timedelta(hours=2)
+            )
+        )
+        self.exit_time_offset_from_month_end = pd.Timedelta(
+            hyper_param_dict.get(
+                "exit_time_offset_from_month_end", pd.Timedelta(hours=0)
             )
         )
         self.look_back_months = look_back_months
         self.prediction_rank_threshold = float(prediction_rank_threshold)
         self.prediction_zscore_threshold = float(prediction_zscore_threshold)
         self.use_all_countries = bool(use_all_countries)
+        sizing_option = hyper_param_dict.get(
+            "sizing_option",
+            "binary"
+        )
+        if not sizing_option in ["binary", "zscore"]:
+            raise ValueError("sizing_option must be either 'binary' or 'zscore'." \
+            "")
+        self.sizing_option = sizing_option
         self.regression_log_path = Path(
             hyper_param_dict.get(
                 "regression_log_path", "amen_regression_diagnostics.csv"
@@ -122,6 +135,11 @@ class AmenStrategy(Strategy):
 
         base_ccy, term_ccy = self._instrument_currencies(instrument)
         relevant_ccys = {base_ccy, term_ccy}
+        
+        # always include US
+        if not "USD" in relevant_ccys:
+            relevant_ccys.add("USD")
+
         return [
             column
             for column in asset_columns
@@ -263,10 +281,10 @@ class AmenStrategy(Strategy):
 
     def generate_signals(self) -> dict[str, pd.Series]:
         asset_past_return = self.create_monthly_asset_returns(
-            self.time_offset_from_month_end
+            self.entry_time_offset_from_month_end
         )
         fx_forward_return_dict = self.create_month_end_fx_returns(
-            self.time_offset_from_month_end
+            self.entry_time_offset_from_month_end
         )
 
         signals: dict[str, pd.Series] = {}
@@ -386,9 +404,11 @@ class AmenStrategy(Strategy):
                     }
                 )
                 regression_rows.append(regression_row)
+
+                sized_signal = np.sign(predicted_return) if self.sizing_option == "binary" else prediction_zscore
                 signal.loc[
-                    (signal.index >= prediction_ts) & (signal.index < month_end_ts)
-                ] = np.sign(prediction_zscore) if keep_signal else 0.0
+                    (signal.index >= prediction_ts) & (signal.index < month_end_ts + self.exit_time_offset_from_month_end)
+                ] = sized_signal if keep_signal else 0.0
 
             signals[instrument] = signal
 

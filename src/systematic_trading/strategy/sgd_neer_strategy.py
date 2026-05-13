@@ -2,7 +2,6 @@ from strategy.strategy import Strategy
 import numpy as np
 import pandas as pd
 
-
 class SGDNEERStrategy(Strategy):
     SGD = "SGD"
     USDSGD = "USDSGD"

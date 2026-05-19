@@ -86,7 +86,7 @@ def return_regression_heatmap(
     return pd.DataFrame(results)
 
 
-def return_regression(
+def rolling_return_regression(
     ret_series: pd.Series,
     past_horizon: pd.Timedelta = pd.Timedelta(minutes=60),
     future_horizon: pd.Timedelta = pd.Timedelta(minutes=5),
@@ -159,16 +159,19 @@ def return_regression(
 
 def apply_position(
     df: pd.DataFrame,
-    tcost_bps=1,
-    margin_multiple=2,
-    adjust_to_target=True,
-    pred_zs_threshold=2.0,
+    tcost_bps: float = 1,
+    margin_multiple: float = 2,
+    adjust_to_target: bool = True,
+    pred_zs_threshold: float = 2.0,
+    delay_trade_on_signal: bool = False,
 ):
     df["tcost"] = tcost_bps / 10_000
+
+    delay = 1 if delay_trade_on_signal else 0
     df["target_position"] = (
         df["prediction"]
-        .shift(1)
-        .where(df["prediction_zscore"].shift(1).abs() > pred_zs_threshold, 0)
+        .shift(delay)
+        .where(df["prediction_zscore"].shift(delay).abs() > pred_zs_threshold, 0)
     )
 
     margin = margin_multiple * df["tcost"]

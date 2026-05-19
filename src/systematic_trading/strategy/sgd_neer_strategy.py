@@ -1,6 +1,8 @@
 from strategy.strategy import Strategy
+from research.sgd_neer import rolling_panel_regression
 import numpy as np
 import pandas as pd
+
 
 class SGDNEERStrategy(Strategy):
     SGD = "SGD"
@@ -31,11 +33,14 @@ class SGDNEERStrategy(Strategy):
         if hyper_param_dict is None:
             hyper_param_dict = {}
 
-        self.rolling_window = pd.Timedelta(
-            hyper_param_dict.get("rolling_window", pd.Timedelta(minutes=30))
+        self.past_horizon = pd.Timedelta(
+            hyper_param_dict.get("past_horizon", pd.Timedelta(minutes=120))
         )
         self.zscore_window = pd.Timedelta(
             hyper_param_dict.get("zscore_window", pd.Timedelta(days=5))
+        )
+        self.future_horizon = pd.Timedelta(
+            hyper_param_dict.get("future_horizon", pd.Timedelta(minutes=15))
         )
         self.zscore_entry_threshold = float(
             hyper_param_dict.get("zscore_entry_threshold", 2.0)
@@ -43,20 +48,16 @@ class SGDNEERStrategy(Strategy):
         if self.zscore_entry_threshold < 0:
             raise ValueError("zscore_entry_threshold must be non-negative.")
 
-        self.zscore_exit_threshold = float(
-            hyper_param_dict.get("zscore_exit_threshold", 0.0)
-        )
-        if self.zscore_exit_threshold < 0:
-            raise ValueError("zscore_exit_threshold must be non-negative.")
-
         self.spread_rolling_window = pd.Timedelta(
-            hyper_param_dict.get("spread_rolling_window", self.rolling_window)
+            hyper_param_dict.get("spread_rolling_window", self.past_horizon)
         )
-        self.spread_entry_multiplier = float(
-            hyper_param_dict.get("spread_entry_multiplier", 5.0)
+        self.margin_multiple = float(hyper_param_dict.get("margin_multiple", 2.0))
+        if self.margin_multiple < 0:
+            raise ValueError("margin_multiple must be non-negative.")
+        self.adjust_to_target = bool(hyper_param_dict.get("adjust_to_target", True))
+        self.delay_trade_on_signal = bool(
+            hyper_param_dict.get("delay_trade_on_signal", False)
         )
-        if self.spread_entry_multiplier < 0:
-            raise ValueError("spread_entry_multiplier must be non-negative.")
 
         self.weights = dict(hyper_param_dict.get("weights", self.DEFAULT_WEIGHTS))
         self.traded_instruments = tuple(traded_instruments)
@@ -75,12 +76,6 @@ class SGDNEERStrategy(Strategy):
 
         logp = np.log(pd.DataFrame(mids).sort_index())
         return logp.diff().dropna(how="any")
-
-    @staticmethod
-    def _signal_pair_for_ccy(ccy: str) -> str:
-        if ccy in ("USD", "USDSGD"):
-            return "USDSGD"
-        return "USD" + ccy
 
     def _pair_signal_for_ccy_signal(
         self, ccy: str, signal: pd.Series
@@ -113,74 +108,85 @@ class SGDNEERStrategy(Strategy):
         )
         return spread_ret.reindex(index)
 
-    def _ccy_entry_spread_threshold(
-        self, ccy: str, index: pd.Index
-    ) -> pd.Series:
-        if self.spread_entry_multiplier == 0:
-            return pd.Series(0.0, index=index, dtype=float)
-
+    def _price_pair_for_ccy(self, ccy: str) -> str:
         if ccy in ("USD", "USDSGD"):
-            running_spread = self._pair_spread_ret(self.USDSGD, index)
-        else:
-            signal_pair, _ = self._pair_signal_for_ccy_signal(
-                ccy, pd.Series(0.0, index=index)
-            )
-            running_spread = self._pair_spread_ret(signal_pair, index)
+            return self.USDSGD
 
-        return (
-            running_spread.rolling(self.spread_rolling_window).mean()
-            * self.spread_entry_multiplier
+        usd_ccy_pair = "USD" + ccy
+        ccy_usd_pair = ccy + "USD"
+
+        if usd_ccy_pair in self.fx_price_dict:
+            return usd_ccy_pair
+        if ccy_usd_pair in self.fx_price_dict:
+            return ccy_usd_pair
+        return self._pair_signal_for_ccy_signal(ccy, pd.Series(dtype=float))[0]
+
+    def _ccy_round_trip_spread_ret(self, ccy: str, index: pd.Index) -> pd.Series:
+        if ccy in ("USD", "USDSGD"):
+            return self._pair_spread_ret(self.USDSGD, index)
+
+        ccy_leg_pair = self._price_pair_for_ccy(ccy)
+        ccy_leg_spread = self._pair_spread_ret(ccy_leg_pair, index)
+        sgd_leg_spread = self._pair_spread_ret(self.USDSGD, index)
+        return ccy_leg_spread + sgd_leg_spread
+
+    def _rolling_half_spread_tcost(self, ccy: str, index: pd.Index) -> pd.Series:
+        spread = self._ccy_round_trip_spread_ret(ccy, index)
+        return 0.5 * spread.rolling(self.spread_rolling_window).mean()
+
+    def _throttle_prediction_signal(
+        self, prediction_df: pd.DataFrame, tcost: pd.Series
+    ) -> pd.Series:
+        if prediction_df.empty:
+            return pd.Series(dtype=float)
+
+        df = prediction_df.join(tcost.rename("tcost"), how="left")
+        delay = 1 if self.delay_trade_on_signal else 0
+        target_position = (
+            df["prediction"]
+            .shift(delay)
+            .where(
+                df["prediction_zscore"].shift(delay).abs()
+                > self.zscore_entry_threshold,
+                0.0,
+            )
         )
 
-    def _generate_currency_signal_series(
-        self,
-        entry_zscore: pd.Series,
-        direction_zscore: pd.Series,
-        past_relative_ret: pd.Series,
-        ret_entry_threshold: pd.Series,
-    ) -> pd.Series:
-        signal = pd.Series(0.0, index=entry_zscore.index)
-        position = 0.0
+        margin = self.margin_multiple * df["tcost"]
+        positions = np.empty(len(df))
+        positions[:] = np.nan
 
-        for ts in entry_zscore.index:
-            entry_z = entry_zscore.loc[ts]
-            direction_z = direction_zscore.loc[ts]
-            rel_ret = past_relative_ret.loc[ts]
-            entry_th = ret_entry_threshold.loc[ts]
+        target = target_position.to_numpy(dtype=float)
+        margin_vals = margin.to_numpy(dtype=float)
 
-            if (
-                pd.isna(entry_z)
-                or pd.isna(direction_z)
-                or pd.isna(rel_ret)
-                or pd.isna(entry_th)
-            ):
-                signal.loc[ts] = 0.0
+        valid = np.flatnonzero(np.isfinite(target) & np.isfinite(margin_vals))
+        if len(valid) == 0:
+            return pd.Series(0.0, index=df.index, dtype=float)
+
+        start = valid[0]
+        positions[:start] = 0.0
+        positions[start] = target[start]
+
+        for i in range(start + 1, len(df)):
+            current_pos = positions[i - 1]
+            t = target[i]
+            m = margin_vals[i]
+
+            if not np.isfinite(t) or not np.isfinite(m):
+                positions[i] = current_pos
                 continue
 
-            if position == 0.0:
-                if abs(rel_ret) < entry_th:
-                    signal.loc[ts] = 0.0
-                    continue
-                if (
-                    entry_z >= self.zscore_entry_threshold
-                    and direction_z >= 0.0
-                ):
-                    position = -1.0
-                elif (
-                    entry_z <= -self.zscore_entry_threshold
-                    and direction_z <= 0.0
-                ):
-                    position = 1.0
-            elif position == 1.0:
-                if entry_z > -self.zscore_exit_threshold:
-                    position = 0.0
-            elif position == -1.0:
-                if entry_z < self.zscore_exit_threshold:
-                    position = 0.0
+            lower = t - m
+            upper = t + m
 
-            signal.loc[ts] = position
+            if current_pos < lower:
+                positions[i] = t if self.adjust_to_target else lower
+            elif current_pos > upper:
+                positions[i] = t if self.adjust_to_target else upper
+            else:
+                positions[i] = current_pos
 
-        return signal
+        return pd.Series(positions, index=df.index, dtype=float)
 
     def build_rets_vs_sgd(self) -> pd.DataFrame:
         rets = self.compute_mid_returns().copy()
@@ -223,30 +229,20 @@ class SGDNEERStrategy(Strategy):
         signals: dict[str, pd.Series] = {}
         ccy_columns = [col for col in rets_vs_sgd.columns if col != "index"]
 
-        past_index_ret = rets_vs_sgd["index"].rolling(self.rolling_window).sum()
-        rolling_mean = past_index_ret.rolling(self.zscore_window).mean()
-        rolling_std = past_index_ret.rolling(self.zscore_window).std()
-        index_past_ret_zscore = (past_index_ret - rolling_mean) / rolling_std
-
         for ccy in ccy_columns:
-            past_relative_ret = (
-                (rets_vs_sgd[ccy] - rets_vs_sgd["index"])
-                .rolling(self.rolling_window)
-                .sum()
+            prediction_df = rolling_panel_regression(
+                rets_vs_sgd["index"],
+                rets_vs_sgd[ccy],
+                past_horizon=self.past_horizon,
+                future_horizon=self.future_horizon,
+                lookback_window=self.zscore_window,
             )
-            rolling_mean = past_relative_ret.rolling(self.zscore_window).mean()
-            rolling_std = past_relative_ret.rolling(self.zscore_window).std()
-            past_relative_ret_zscore = (past_relative_ret - rolling_mean) / rolling_std
-
-            ret_entry_threshold = self._ccy_entry_spread_threshold(
-                ccy, rets_vs_sgd.index
+            tcost = self._rolling_half_spread_tcost(ccy, prediction_df.index)
+            signal = self._throttle_prediction_signal(
+                prediction_df,
+                tcost,
             )
-            signal = self._generate_currency_signal_series(
-                index_past_ret_zscore,
-                past_relative_ret_zscore,
-                past_relative_ret,
-                ret_entry_threshold,
-            )
+            signal = signal.reindex(rets_vs_sgd.index).fillna(0.0)
             signal.name = ccy
             signals[ccy] = signal
 
@@ -266,8 +262,9 @@ class SGDNEERStrategy(Strategy):
                     "USDSGD", pd.Series(0.0, index=rets_vs_sgd.index, name="USDSGD")
                 )
                 pair_signals["USDSGD"] = pair_signals["USDSGD"].add(
-                    -signal, fill_value=0.0
-                    #0.0, fill_value=0.0
+                    -signal,
+                    fill_value=0.0,
+                    # 0.0, fill_value=0.0
                 )
                 continue
 

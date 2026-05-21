@@ -1,5 +1,5 @@
 from strategy.strategy import Strategy
-from research.sgd_neer import rolling_panel_regression
+from research.sgd_neer import rolling_panel_regression, DEFAULT_WEIGHTS
 import numpy as np
 import pandas as pd
 
@@ -8,21 +8,6 @@ class SGDNEERStrategy(Strategy):
     SGD = "SGD"
     USDSGD = "USDSGD"
 
-    DEFAULT_WEIGHTS = {
-        USDSGD: 0.1987,
-        "EURUSD": 0.1503,
-        "USDCNH": 0.1476,
-        "USDMYR": 0.1162,
-        "USDJPY": 0.0938,
-        "AUDUSD": 0.065,
-        "USDINR": 0.0533,
-        "USDKRW": 0.046,
-        "USDTHB": 0.1083,
-        "USDIDR": 0.0313,
-        "USDTWD": 0.0244,
-        "GBPUSD": 0.0182,
-        "USDHKD": 0.016,
-    }
 
     def __init__(
         self,
@@ -42,6 +27,9 @@ class SGDNEERStrategy(Strategy):
         self.future_horizon = pd.Timedelta(
             hyper_param_dict.get("future_horizon", pd.Timedelta(minutes=15))
         )
+        self.first_stage_beta_mode = hyper_param_dict.get(
+            "first_stage_beta_mode", "regression"
+        )
         self.zscore_entry_threshold = float(
             hyper_param_dict.get("zscore_entry_threshold", 2.0)
         )
@@ -59,7 +47,7 @@ class SGDNEERStrategy(Strategy):
             hyper_param_dict.get("delay_trade_on_signal", False)
         )
 
-        self.weights = dict(hyper_param_dict.get("weights", self.DEFAULT_WEIGHTS))
+        self.weights = dict(hyper_param_dict.get("weights", DEFAULT_WEIGHTS))
         self.traded_instruments = tuple(traded_instruments)
         self.fx_price_dict = fx_price_dict
 
@@ -236,6 +224,8 @@ class SGDNEERStrategy(Strategy):
                 past_horizon=self.past_horizon,
                 future_horizon=self.future_horizon,
                 lookback_window=self.zscore_window,
+                first_stage_beta_mode=self.first_stage_beta_mode,
+                pair_weights=self.weights,
             )
             tcost = self._rolling_half_spread_tcost(ccy, prediction_df.index)
             signal = self._throttle_prediction_signal(

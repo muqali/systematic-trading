@@ -3,6 +3,16 @@ import numpy as np
 import statsmodels.api as sm
 
 
+def regression_stats(x, y):
+    sample = pd.concat({"x": x, "y": y}, axis=1).dropna()
+    if len(sample) < 3 or sample["x"].var() == 0 or sample["y"].var() == 0:
+        return np.nan, np.nan, len(sample)
+
+    beta = sample["y"].cov(sample["x"]) / sample["x"].var()
+    corr = sample["x"].corr(sample["y"])
+    return beta, corr, len(sample)
+
+
 def variance_ratio(
     ret_series: pd.Series, max_horizon: pd.Timedelta = pd.Timedelta(hours=1)
 ):
@@ -22,13 +32,17 @@ def variance_ratio(
 
 def return_regression_heatmap(
     ret_series: pd.Series,
-    past_max_horizon: pd.Timedelta,
-    future_max_horizon: pd.Timedelta,
+    past_periods: tuple[pd.Timedelta],
+    future_periods: tuple[pd.Timedelta],
+    zscore_window: pd.Timedelta,
+    abs_z_buckets: tuple[tuple[float, float], ...] = (
+        (0, 0.5),
+        (0.5, 1),
+        (1, 2),
+        (2, np.inf),
+    ),
 ):
     freq = ret_series.index.diff().min()
-    past_periods = pd.timedelta_range(start=freq, end=past_max_horizon, freq=freq)
-    future_periods = pd.timedelta_range(start=freq, end=future_max_horizon, freq=freq)
-
     results = []
 
     for p_timedelta in past_periods:
@@ -44,44 +58,61 @@ def return_regression_heatmap(
             # Calculate rolling sum for past p periods
             return_past = ret_series.rolling(window=p).sum()
 
+            abs_zscore_past = (
+                (return_past - return_past.rolling(zscore_window).mean())
+                / return_past.rolling(zscore_window).std()
+            ).abs()
+
             # Calculate rolling sum for future f periods (shifted backwards)
             return_future = ret_series.rolling(window=f).sum().shift(-f)
 
             # Create DataFrame and drop NaN values
             df = pd.DataFrame(
-                {"return_past": return_past, "return_future": return_future}
+                {
+                    "return_past": return_past,
+                    "return_future": return_future,
+                    "abs_zscore_past": abs_zscore_past,
+                }
             ).dropna()
 
-            # Skip if not enough data points
-            if len(df) < 2:
-                continue
+            for lower, upper in abs_z_buckets:
+                bucket_mask = (df["abs_zscore_past"] >= lower) & (
+                    df["abs_zscore_past"] < upper
+                )
+                bucket_df = df[bucket_mask]
 
-            # Calculate correlation
-            correlation = df["return_past"].corr(df["return_future"])
+                # Skip if not enough data points
+                if len(bucket_df) < 2:
+                    continue
 
-            # Add constant for intercept
-            X = sm.add_constant(df["return_past"])
-            y = df["return_future"]
+                # Calculate correlation
+                correlation = bucket_df["return_past"].corr(bucket_df["return_future"])
 
-            # Fit model
-            model = sm.OLS(y, X).fit()
+                # Add constant for intercept
+                X = sm.add_constant(bucket_df["return_past"], has_constant="add")
+                y = bucket_df["return_future"]
 
-            results.append(
-                {
-                    "past_period": p_timedelta,
-                    "future_period": f_timedelta,
-                    "past_period_seconds": p_timedelta.total_seconds(),
-                    "future_period_seconds": f_timedelta.total_seconds(),
-                    "beta": model.params["return_past"],
-                    "alpha": model.params["const"],
-                    "correlation": correlation,
-                    "beta": model.params["return_past"],
-                    "p_value": model.pvalues["return_past"],
-                    "r_squared": model.rsquared,
-                    "std_err": model.bse["return_past"],
-                    "n_observations": len(df),
-                }
-            )
+                # Fit model
+                model = sm.OLS(y, X).fit()
+                abs_z_bucket = f"{lower}-{upper}"
+
+                results.append(
+                    {
+                        "name": ret_series.name,
+                        "past_period": p_timedelta,
+                        "future_period": f_timedelta,
+                        "past_period_seconds": p_timedelta.total_seconds(),
+                        "future_period_seconds": f_timedelta.total_seconds(),
+                        "abs_z_bucket": abs_z_bucket,
+                        "correlation": correlation,
+                        "beta": model.params["return_past"],
+                        "n_observations": len(bucket_df),
+                        "r_squared": model.rsquared,
+                        "alpha": model.params["const"],
+                        "p_value": model.pvalues["return_past"],
+                        "std_err": model.bse["return_past"],
+                    }
+                )
 
     return pd.DataFrame(results)
 

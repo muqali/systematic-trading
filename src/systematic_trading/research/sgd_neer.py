@@ -1,5 +1,7 @@
+from research.mean_reversion import return_regression_heatmap
 import numpy as np
 import pandas as pd
+import statsmodels.api as sm
 
 DEFAULT_WEIGHTS = {
     "USDSGD": 0.1987,
@@ -34,20 +36,67 @@ INDEX_CCY_TO_PAIR_MAP = {
 }
 
 
-def regression_stats(x, y):
-    sample = pd.concat({"x": x, "y": y}, axis=1).dropna()
-    if len(sample) < 3 or sample["x"].var() == 0 or sample["y"].var() == 0:
-        return np.nan, np.nan, len(sample)
-
-    beta = sample["y"].cov(sample["x"]) / sample["x"].var()
-    corr = sample["x"].corr(sample["y"])
-    return beta, corr, len(sample)
-
-
 def sharpe(pnl_series: pd.Series):
     daily_pnl_series = pnl_series.resample("1D").sum()
 
     return daily_pnl_series.mean() / daily_pnl_series.std() * np.sqrt(252)
+
+
+def compute_mid_returns(price_dict: dict[str, pd.DataFrame]) -> pd.DataFrame:
+    mids = {pair: df["mid"] for pair, df in price_dict.items() if "mid" in df.columns}
+    if not mids:
+        raise ValueError(
+            "fx_price_dict must contain at least one DataFrame with a mid column."
+        )
+
+    logp = np.log(pd.DataFrame(mids).sort_index())
+    return logp.diff()
+
+
+def build_rets_vs_sgd(price_dict: dict[str, pd.DataFrame]) -> pd.DataFrame:
+    """Build log returns for SGD against NEER basket currencies.
+
+    The input prices are FX pairs quoted against USD and must include USDSGD.
+    Output currency columns use SGD as the base currency, so column ``X`` is
+    the log return of SGD/X. The ``index`` column is the normalised weighted
+    average of the available pairs in ``DEFAULT_WEIGHTS`` and is NaN whenever
+    any included component return is NaN.
+    """
+    rets = compute_mid_returns(price_dict).copy()
+    if "USDSGD" not in rets.columns:
+        raise ValueError("USDSGD is required to build SGD NEER returns.")
+
+    available_weighted_pairs = [
+        pair for pair in DEFAULT_WEIGHTS if pair in rets.columns
+    ]
+    weights = normalised_weights(available_weighted_pairs)
+
+    usd_ccy_rets: dict[str, pd.Series] = {"USD": -rets["USDSGD"]}
+    index_ret = pd.Series(0.0, index=rets.index, dtype=float)
+
+    for pair, weight in weights.items():
+        if pair == "USDSGD":
+            sgd_ccy_ret = -rets[pair]
+        elif pair.startswith("USD"):
+            ccy = pair[3:]
+            usd_ccy_rets[ccy] = rets[pair]
+            sgd_ccy_ret = rets[pair] - rets["USDSGD"]
+        else:
+            ccy = pair[:3]
+            usd_ccy_rets[ccy] = -rets[pair]
+            sgd_ccy_ret = -rets[pair] - rets["USDSGD"]
+
+        index_ret = index_ret + weight * sgd_ccy_ret
+
+    rets_vs_sgd = pd.DataFrame(index=rets.index)
+    rets_vs_sgd["index"] = index_ret
+    for ccy in usd_ccy_rets:
+        if ccy == "USD":
+            rets_vs_sgd[ccy] = usd_ccy_rets[ccy]
+        else:
+            rets_vs_sgd[ccy] = usd_ccy_rets[ccy] - rets["USDSGD"]
+
+    return rets_vs_sgd
 
 
 def normalised_weights(pairs: list[str]) -> dict[str, float]:
@@ -130,9 +179,7 @@ def rolling_panel_regression(
         residual_beta = residual_sum_y / residual_sum_sq
         index_beta = s_xy / s_xx
         alpha = (sum_y - index_beta * sum_x) / w
-        sum_resid_sq = (
-            s_yy - residual_beta * residual_sum_y - index_beta * s_xy
-        )
+        sum_resid_sq = s_yy - residual_beta * residual_sum_y - index_beta * s_xy
         se_residual_beta = np.sqrt((sum_resid_sq / (w - 3)) / residual_sum_sq)
         correlation = residual_sum_y / np.sqrt(residual_sum_sq * s_yy)
     else:
@@ -212,3 +259,110 @@ def rolling_panel_regression(
     results.attrs["ccy"] = ccy
 
     return results
+
+
+def panel_regression_heatmap(
+    index_ret_series: pd.Series,
+    currency_ret_series: pd.Series,
+    past_periods: tuple[pd.Timedelta],
+    future_periods: tuple[pd.Timedelta],
+    zscore_window: pd.Timedelta,
+    abs_z_buckets: tuple[tuple[float, float], ...] = (
+        (0, 0.5),
+        (0.5, 1),
+        (1, 2),
+        (2, np.inf),
+    ),
+):
+    freq = index_ret_series.index.diff().min()
+    results = []
+
+    for p_timedelta in past_periods:
+        for f_timedelta in future_periods:
+            # Convert timedeltas into number of periods
+            p = int(p_timedelta / freq)
+            f = int(f_timedelta / freq)
+
+            # Skip if periods are less than 1
+            if p < 1 or f < 1:
+                continue
+
+            # Calculate rolling sum for past p periods
+            index_return_past = index_ret_series.rolling(window=p).sum()
+            ccy_return_past = currency_ret_series.rolling(window=p).sum()
+            ccy_relative_return_past = ccy_return_past - index_return_past
+
+            abs_zscore_ccy_relative_past = (
+                (
+                    ccy_relative_return_past
+                    - ccy_relative_return_past.rolling(zscore_window).mean()
+                )
+                / ccy_relative_return_past.rolling(zscore_window).std()
+            ).abs()
+
+            # Calculate rolling sum for future f periods (shifted backwards)
+            ccy_return_future = currency_ret_series.rolling(window=f).sum().shift(-f)
+
+            # Create DataFrame and drop NaN values
+            df = pd.DataFrame(
+                {
+                    "index_return_past": index_return_past,
+                    "ccy_return_past": ccy_return_past,
+                    "ccy_relative_return_past": ccy_relative_return_past,
+                    "ccy_return_future": ccy_return_future,
+                    "abs_zscore_ccy_relative_past": abs_zscore_ccy_relative_past,
+                }
+            ).dropna()
+
+            for lower, upper in abs_z_buckets:
+                bucket_mask = (df["abs_zscore_ccy_relative_past"] >= lower) & (
+                    df["abs_zscore_ccy_relative_past"] < upper
+                )
+                bucket_df = df[bucket_mask]
+
+                # Skip if not enough data points
+                if len(bucket_df) < 3:
+                    continue
+
+                # Calculate marginal correlations
+                index_correlation = bucket_df["index_return_past"].corr(
+                    bucket_df["ccy_return_future"]
+                )
+                relative_correlation = bucket_df["ccy_relative_return_past"].corr(
+                    bucket_df["ccy_return_future"]
+                )
+
+                # Add constant for intercept
+                X = sm.add_constant(
+                    bucket_df[["index_return_past", "ccy_relative_return_past"]],
+                    has_constant="add",
+                )
+                y = bucket_df["ccy_return_future"]
+
+                # Fit model
+                model = sm.OLS(y, X).fit()
+                abs_z_bucket = f"{lower}-{upper}"
+
+                results.append(
+                    {
+                        "name": currency_ret_series.name,
+                        "past_period": p_timedelta,
+                        "future_period": f_timedelta,
+                        "past_period_seconds": p_timedelta.total_seconds(),
+                        "future_period_seconds": f_timedelta.total_seconds(),
+                        "abs_z_bucket": abs_z_bucket,
+                        "index_correlation": index_correlation,
+                        "relative_correlation": relative_correlation,
+                        "relative_beta": model.params["ccy_relative_return_past"],
+                        "index_beta": model.params["index_return_past"],
+                        "n_observations": len(bucket_df),
+                        "r_squared": model.rsquared,
+                        "alpha": model.params["const"],
+                        "relative_p_value": model.pvalues["ccy_relative_return_past"],
+                        "index_p_value": model.pvalues["index_return_past"],
+                        "relative_std_err": model.bse["ccy_relative_return_past"],
+                        "index_std_err": model.bse["index_return_past"],
+                    }
+                )
+
+    return pd.DataFrame(results)

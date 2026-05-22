@@ -1,5 +1,9 @@
 from strategy.strategy import Strategy
-from research.sgd_neer import rolling_panel_regression, DEFAULT_WEIGHTS
+from research.sgd_neer import (
+    rolling_panel_regression,
+    build_rets_vs_sgd,
+    DEFAULT_WEIGHTS,
+)
 import numpy as np
 import pandas as pd
 
@@ -7,7 +11,6 @@ import pandas as pd
 class SGDNEERStrategy(Strategy):
     SGD = "SGD"
     USDSGD = "USDSGD"
-
 
     def __init__(
         self,
@@ -51,19 +54,6 @@ class SGDNEERStrategy(Strategy):
         self.traded_instruments = tuple(traded_instruments)
         self.fx_price_dict = fx_price_dict
 
-    def compute_mid_returns(self) -> pd.DataFrame:
-        mids = {
-            pair: df["mid"]
-            for pair, df in self.fx_price_dict.items()
-            if "mid" in df.columns
-        }
-        if not mids:
-            raise ValueError(
-                "fx_price_dict must contain at least one DataFrame with a mid column."
-            )
-
-        logp = np.log(pd.DataFrame(mids).sort_index())
-        return logp.diff().dropna(how="any")
 
     def _pair_signal_for_ccy_signal(
         self, ccy: str, signal: pd.Series
@@ -76,15 +66,6 @@ class SGDNEERStrategy(Strategy):
         if ccy_usd_pair in self.traded_instruments:
             return ccy_usd_pair, -signal
         return usd_ccy_pair, signal
-
-    def _normalised_weights(self, pairs: list[str]) -> dict[str, float]:
-        raw_weights = {
-            pair: self.weights[pair] for pair in pairs if pair in self.weights
-        }
-        total_weight = sum(raw_weights.values())
-        if total_weight <= 0:
-            raise ValueError("At least one positive NEER weight is required.")
-        return {pair: weight / total_weight for pair, weight in raw_weights.items()}
 
     def _pair_spread_ret(self, pair: str, index: pd.Index) -> pd.Series:
         pair_df = self.fx_price_dict.get(pair)
@@ -176,42 +157,6 @@ class SGDNEERStrategy(Strategy):
 
         return pd.Series(positions, index=df.index, dtype=float)
 
-    def build_rets_vs_sgd(self) -> pd.DataFrame:
-        rets = self.compute_mid_returns().copy()
-        if self.USDSGD not in rets.columns:
-            raise ValueError("USDSGD is required to build SGD NEER returns.")
-
-        available_weighted_pairs = [
-            pair for pair in self.weights if pair in rets.columns
-        ]
-        weights = self._normalised_weights(available_weighted_pairs)
-
-        usd_ccy_rets: dict[str, pd.Series] = {"USD": -rets[self.USDSGD]}
-        index_ret = pd.Series(0.0, index=rets.index, dtype=float)
-
-        for pair, weight in weights.items():
-            if pair == self.USDSGD:
-                sgd_ccy_ret = -rets[pair]
-            elif pair.startswith("USD"):
-                ccy = pair[3:]
-                usd_ccy_rets[ccy] = rets[pair]
-                sgd_ccy_ret = rets[pair] - rets[self.USDSGD]
-            else:
-                ccy = pair[:3]
-                usd_ccy_rets[ccy] = -rets[pair]
-                sgd_ccy_ret = -rets[pair] - rets[self.USDSGD]
-
-            index_ret = index_ret.add(weight * sgd_ccy_ret, fill_value=0.0)
-
-        rets_vs_sgd = pd.DataFrame(index=rets.index)
-        rets_vs_sgd["index"] = index_ret
-        for ccy in usd_ccy_rets:
-            if ccy == "USD":
-                rets_vs_sgd[ccy] = usd_ccy_rets[ccy]
-            else:
-                rets_vs_sgd[ccy] = usd_ccy_rets[ccy] - rets[self.USDSGD]
-
-        return rets_vs_sgd.dropna(how="any")
 
     def _currency_signals(self, rets_vs_sgd: pd.DataFrame) -> dict[str, pd.Series]:
         signals: dict[str, pd.Series] = {}
@@ -239,7 +184,7 @@ class SGDNEERStrategy(Strategy):
         return signals
 
     def generate_signals(self) -> dict[str, pd.Series]:
-        rets_vs_sgd = self.build_rets_vs_sgd()
+        rets_vs_sgd = build_rets_vs_sgd(self.fx_price_dict)
         ccy_signals = self._currency_signals(rets_vs_sgd)
         pair_signals: dict[str, pd.Series] = {
             pair: pd.Series(0.0, index=rets_vs_sgd.index, name=pair)

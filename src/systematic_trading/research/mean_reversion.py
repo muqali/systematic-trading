@@ -1,3 +1,5 @@
+from util.mis_util import calc_sharpe
+from util.optimisation_util import sweep_parameters
 import pandas as pd
 import numpy as np
 import statsmodels.api as sm
@@ -94,7 +96,7 @@ def return_regression_heatmap(
 
                 # Fit model
                 model = sm.OLS(y, X).fit()
-                abs_z_bucket = f"{lower}-{upper}"
+                abs_z_bucket = f"({lower},{upper})"
 
                 results.append(
                     {
@@ -152,7 +154,7 @@ def rolling_return_regression(
     alpha = (sum_y - beta * sum_x) / w
 
     # Predictions
-    predictions = alpha + beta * x
+    predictions = alpha.shift(f) + beta.shift(f) * x
 
     # Exact in-window RSS via OLS identify
     sum_resid_sq = sum_yy - beta * sum_xy - alpha * sum_y
@@ -236,3 +238,81 @@ def apply_position(
 
     df["position"] = positions
     return df
+
+
+def optimise_rolling_return_regression(
+    ret_series,
+    sort_key: str = "net_sharpe",
+    grid: dict | None = None,
+):
+    if grid is None:
+        grid = {
+            "past_horizon": [
+                pd.Timedelta(minutes=60),
+                pd.Timedelta(minutes=120),
+            ],
+            "future_horizon": [
+                pd.Timedelta(minutes=15),
+                pd.Timedelta(minutes=30),
+                pd.Timedelta(minutes=60),
+            ],
+            "lookback_window": [pd.Timedelta(days=5)],
+            "tcost_bps": [1.0, 2.0],
+            "margin_multiple": np.arange(0.0, 2.0, 0.5),
+            "adjust_to_target": (True, False),
+            "pred_zs_threshold": np.arange(0.0, 2.0, 0.5),
+        }
+
+    regression_cache: dict[
+        tuple[pd.Timedelta, pd.Timedelta, pd.Timedelta], pd.DataFrame
+    ] = {}
+
+    def get_regression_df(
+        past_horizon: pd.Timedelta,
+        future_horizon: pd.Timedelta,
+        lookback_window: pd.Timedelta,
+    ) -> pd.DataFrame:
+        key = (past_horizon, future_horizon, lookback_window)
+        if key not in regression_cache:
+            df = rolling_return_regression(
+                ret_series, past_horizon, future_horizon, lookback_window
+            )
+            regression_cache[key] = df.join(ret_series.rename("ret"), how="left")
+
+        return regression_cache[key]
+
+    def objective_fn(
+        past_horizon: pd.Timedelta,
+        future_horizon: pd.Timedelta,
+        lookback_window: pd.Timedelta,
+        tcost_bps: float,
+        margin_multiple: float,
+        adjust_to_target: bool,
+        pred_zs_threshold: float,
+    ):
+        df = get_regression_df(
+            past_horizon,
+            future_horizon,
+            lookback_window,
+        ).copy()
+        df = apply_position(
+            df, tcost_bps, margin_multiple, adjust_to_target, pred_zs_threshold
+        )
+
+        df["frictionless_pnl"] = df["target_position"].shift(1) * df["ret"]
+        df["gross_pnl"] = df["position"].shift(1) * df["ret"]
+        df["net_pnl"] = (
+            df["gross_pnl"] - 0.5 * df["tcost"] * df["position"].diff().abs()
+        )
+
+        return {
+            "net_sharpe": calc_sharpe(df["net_pnl"]),
+            "gross_sharpe": calc_sharpe(df["gross_pnl"]),
+            "frictionless_sharpe": calc_sharpe(df["frictionless_pnl"].dropna()),
+        }
+
+    sweep = sweep_parameters(grid, objective_fn)
+
+    sweep = sweep.sort_values(sort_key, ascending=False)
+
+    return sweep

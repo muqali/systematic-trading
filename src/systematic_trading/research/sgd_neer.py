@@ -36,12 +36,6 @@ INDEX_CCY_TO_PAIR_MAP = {
 }
 
 
-def sharpe(pnl_series: pd.Series):
-    daily_pnl_series = pnl_series.resample("1D").sum()
-
-    return daily_pnl_series.mean() / daily_pnl_series.std() * np.sqrt(252)
-
-
 def compute_mid_returns(price_dict: dict[str, pd.DataFrame]) -> pd.DataFrame:
     mids = {pair: df["mid"] for pair, df in price_dict.items() if "mid" in df.columns}
     if not mids:

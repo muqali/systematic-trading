@@ -34,6 +34,16 @@ class AmenStrategy(Strategy):
         if prediction_zscore_threshold < 0:
             raise ValueError("prediction_zscore_threshold must be non-negative.")
         use_all_countries = hyper_param_dict.get("use_all_countries", True)
+        quarterly_weight = float(hyper_param_dict.get("quarterly_weight", 0.0))
+        if not 0.0 <= quarterly_weight <= 1.0:
+            raise ValueError("quarterly_weight must be in [0, 1].")
+        quarterly_regression_mode = hyper_param_dict.get(
+            "quarterly_regression_mode", "shared"
+        )
+        if quarterly_regression_mode not in ["shared", "qe_only"]:
+            raise ValueError(
+                "quarterly_regression_mode must be either 'shared' or 'qe_only'."
+            )
 
         self.instruments = traded_instruments
         self.fx_price_dict = fx_price_dict
@@ -53,6 +63,8 @@ class AmenStrategy(Strategy):
         self.prediction_rank_threshold = float(prediction_rank_threshold)
         self.prediction_zscore_threshold = float(prediction_zscore_threshold)
         self.use_all_countries = bool(use_all_countries)
+        self.quarterly_weight = quarterly_weight
+        self.quarterly_regression_mode = quarterly_regression_mode
         sizing_option = hyper_param_dict.get(
             "sizing_option",
             "binary"
@@ -202,12 +214,26 @@ class AmenStrategy(Strategy):
 
         return fx_returns
 
-    def create_monthly_asset_returns(
-        self, time_offset_from_month_end: pd.Timedelta = pd.Timedelta(days=1)
+    def create_asset_returns(
+        self,
+        return_period: str = "monthly",
+        time_offset_from_month_end: pd.Timedelta = pd.Timedelta(days=1),
     ) -> pd.DataFrame:
         time_offset_from_month_end = pd.Timedelta(time_offset_from_month_end)
         if time_offset_from_month_end < pd.Timedelta(0):
             raise ValueError("time_offset_from_month_end must be non-negative.")
+
+        period_alias_by_name = {
+            "monthly": "M",
+            "quarterly": "Q",
+        }
+        period_alias = period_alias_by_name.get(return_period)
+        if period_alias is None:
+            supported_periods = ", ".join(sorted(period_alias_by_name))
+            raise ValueError(
+                f"Unsupported return_period '{return_period}'. "
+                f"Supported periods: {supported_periods}."
+            )
 
         def build_asset_returns(
             close_dict: dict[str, pd.DataFrame], asset_name: str
@@ -225,41 +251,47 @@ class AmenStrategy(Strategy):
                 if close.empty:
                     continue
 
-                monthly_rows = []
-                month_periods = close.index.tz_localize(None).to_period("M")
-                months = month_periods.unique().sort_values()
+                return_rows = []
+                close_periods = close.index.tz_localize(None).to_period(period_alias)
+                periods = close_periods.unique().sort_values()
 
-                for i in range(1, len(months)):
-                    prev_month = months[i - 1]
-                    month = months[i]
+                for i in range(1, len(periods)):
+                    prev_period = periods[i - 1]
+                    period = periods[i]
+                    target_month = (
+                        period if period_alias == "M" else period.asfreq("M", how="end")
+                    )
 
                     target_ts = self._subtract_weekend_excluding_offset(
-                        self._month_end_time(month), time_offset_from_month_end
+                        self._month_end_time(target_month), time_offset_from_month_end
                     )
 
                     target_value_ts, target_close = self._asof_index_and_value(
                         close, target_ts
                     )
-                    prev_month_close = close[month_periods == prev_month]
+                    prev_period_close = close[close_periods == prev_period]
 
-                    if prev_month_close.empty or target_close is None:
+                    if prev_period_close.empty or target_close is None:
                         continue
 
-                    prev_close = prev_month_close.iloc[-1]
-                    if target_value_ts.tz_localize(None).to_period("M") != month:
+                    prev_close = prev_period_close.iloc[-1]
+                    if (
+                        target_value_ts.tz_localize(None).to_period(period_alias)
+                        != period
+                    ):
                         continue
 
-                    monthly_rows.append(
+                    return_rows.append(
                         {
                             "timestamp": target_ts,
                             f"{asset_name}_{ccy}": target_close / prev_close - 1,
                         }
                     )
 
-                if not monthly_rows:
+                if not return_rows:
                     continue
 
-                ccy_returns = pd.DataFrame(monthly_rows).set_index("timestamp")
+                ccy_returns = pd.DataFrame(return_rows).set_index("timestamp")
 
                 if not ccy_returns.empty:
                     asset_returns[f"{asset_name}_{ccy}"] = ccy_returns.iloc[:, 0]
@@ -279,10 +311,49 @@ class AmenStrategy(Strategy):
 
         return pd.concat([equity_returns, bond_returns], axis=1).sort_index()
 
+    def create_monthly_asset_returns(
+        self, time_offset_from_month_end: pd.Timedelta = pd.Timedelta(days=1)
+    ) -> pd.DataFrame:
+        return self.create_asset_returns("monthly", time_offset_from_month_end)
+
+    def create_quarterly_asset_returns(
+        self, time_offset_from_month_end: pd.Timedelta = pd.Timedelta(days=1)
+    ) -> pd.DataFrame:
+        return self.create_asset_returns("quarterly", time_offset_from_month_end)
+
     def generate_signals(self) -> dict[str, pd.Series]:
-        asset_past_return = self.create_monthly_asset_returns(
+        monthly_asset_return = self.create_monthly_asset_returns(
             self.entry_time_offset_from_month_end
         )
+        weighted_asset_return = monthly_asset_return.copy()
+
+        if self.quarterly_weight > 0.0:
+            quarterly_asset_return = self.create_quarterly_asset_returns(
+                self.entry_time_offset_from_month_end,
+            )
+            if not quarterly_asset_return.empty:
+                blended_columns = monthly_asset_return.columns.intersection(
+                    quarterly_asset_return.columns
+                )
+                blended_index = monthly_asset_return.index.intersection(
+                    quarterly_asset_return.index
+                )
+                blended_index = blended_index[
+                    blended_index.month.isin([3, 6, 9, 12])
+                ]
+                if len(blended_columns) > 0 and len(blended_index) > 0:
+                    weighted_asset_return.loc[blended_index, blended_columns] = (
+                        (1.0 - self.quarterly_weight)
+                        * monthly_asset_return.loc[blended_index, blended_columns]
+                        + self.quarterly_weight
+                        * quarterly_asset_return.loc[blended_index, blended_columns]
+                    )
+        asset_past_return = weighted_asset_return
+        monthly_only_non_qe = (
+            self.quarterly_weight > 0.0
+            and self.quarterly_regression_mode == "qe_only"
+        )
+
         fx_forward_return_dict = self.create_month_end_fx_returns(
             self.entry_time_offset_from_month_end
         )
@@ -310,7 +381,7 @@ class AmenStrategy(Strategy):
                 signals[instrument] = signal
                 continue
 
-            combined = pd.concat(
+            weighted_combined = pd.concat(
                 [
                     fx_forward_return.rename(instrument),
                     asset_past_return[selected_asset_columns],
@@ -319,11 +390,31 @@ class AmenStrategy(Strategy):
                 join="inner",
             ).dropna()
 
-            if combined.empty:
+            if weighted_combined.empty:
                 signals[instrument] = signal
                 continue
 
-            for prediction_ts in combined.index:
+            monthly_combined = pd.DataFrame()
+            if monthly_only_non_qe:
+                monthly_combined = pd.concat(
+                    [
+                        fx_forward_return.rename(instrument),
+                        monthly_asset_return[selected_asset_columns],
+                    ],
+                    axis=1,
+                    join="inner",
+                ).dropna()
+
+            for prediction_ts in weighted_combined.index:
+                if (
+                    monthly_only_non_qe
+                    and prediction_ts.month not in (3, 6, 9, 12)
+                    and prediction_ts in monthly_combined.index
+                ):
+                    combined = monthly_combined
+                else:
+                    combined = weighted_combined
+
                 history = combined.loc[combined.index < prediction_ts].tail(
                     self.look_back_months
                 )
@@ -394,6 +485,8 @@ class AmenStrategy(Strategy):
                     "prediction_rank_threshold": self.prediction_rank_threshold,
                     "prediction_zscore_threshold": self.prediction_zscore_threshold,
                     "use_all_countries": self.use_all_countries,
+                    "quarterly_weight": self.quarterly_weight,
+                    "quarterly_regression_mode": self.quarterly_regression_mode,
                     "regressor_columns": ",".join(selected_asset_columns),
                     "signal_kept": keep_signal,
                 }

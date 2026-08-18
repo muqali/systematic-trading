@@ -2,6 +2,8 @@ from pathlib import Path
 import pandas as pd
 import datetime as dt
 
+from util.fx_util import get_pip_size
+
 CSV_DATA_DIR = Path.home() / "Programming" / "data" / "daily"
 
 BOND_TICKERS_DICT = {
@@ -158,6 +160,12 @@ def get_fwdpts(
     requested_tickers = {
         ccypair: f"{FWD_TICKERS_DICT[ccypair]}{tenor}" for ccypair in ccypairs
     }
+    pip_sizes = {ccypair: get_pip_size(ccypair) for ccypair in ccypairs}
+    missing_pip_sizes = [
+        ccypair for ccypair, pip_size in pip_sizes.items() if pip_size is None
+    ]
+    if missing_pip_sizes:
+        raise ValueError(f"Missing pip sizes for currency pairs: {missing_pip_sizes}.")
 
     available_columns = pd.read_csv(file_path, nrows=0, encoding="utf-8-sig").columns
     missing_tickers = [
@@ -190,7 +198,7 @@ def get_fwdpts(
     df = df.loc[(df.index >= start_ts) & (df.index <= end_ts)]
 
     return {
-        ccypair: df[[ticker]].rename(columns={ticker: "close"})
+        ccypair: (df[[ticker]] * pip_sizes[ccypair]).rename(columns={ticker: "close"})
         for ccypair, ticker in requested_tickers.items()
     }
 

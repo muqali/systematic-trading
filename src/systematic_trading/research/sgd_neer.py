@@ -47,23 +47,25 @@ def compute_mid_returns(price_dict: dict[str, pd.DataFrame]) -> pd.DataFrame:
     return logp.diff()
 
 
-def build_rets_vs_sgd(price_dict: dict[str, pd.DataFrame]) -> pd.DataFrame:
+def build_rets_vs_sgd(
+    price_dict: dict[str, pd.DataFrame],
+    pair_weights: dict[str, float] | None = None,
+) -> pd.DataFrame:
     """Build log returns for SGD against NEER basket currencies.
 
     The input prices are FX pairs quoted against USD and must include USDSGD.
     Output currency columns use SGD as the base currency, so column ``X`` is
     the log return of SGD/X. The ``index`` column is the normalised weighted
-    average of the available pairs in ``DEFAULT_WEIGHTS`` and is NaN whenever
-    any included component return is NaN.
+    average of the available pairs in ``pair_weights`` (``DEFAULT_WEIGHTS`` by
+    default) and is NaN whenever any included component return is NaN.
     """
     rets = compute_mid_returns(price_dict).copy()
     if "USDSGD" not in rets.columns:
         raise ValueError("USDSGD is required to build SGD NEER returns.")
 
-    available_weighted_pairs = [
-        pair for pair in DEFAULT_WEIGHTS if pair in rets.columns
-    ]
-    weights = normalised_weights(available_weighted_pairs)
+    pair_weights = DEFAULT_WEIGHTS if pair_weights is None else pair_weights
+    available_weighted_pairs = [pair for pair in pair_weights if pair in rets.columns]
+    weights = normalised_weights(available_weighted_pairs, pair_weights)
 
     usd_ccy_rets: dict[str, pd.Series] = {"USD": -rets["USDSGD"]}
     index_ret = pd.Series(0.0, index=rets.index, dtype=float)
@@ -93,8 +95,13 @@ def build_rets_vs_sgd(price_dict: dict[str, pd.DataFrame]) -> pd.DataFrame:
     return rets_vs_sgd
 
 
-def normalised_weights(pairs: list[str]) -> dict[str, float]:
-    raw_weights = {pair: DEFAULT_WEIGHTS.get(pair, 0) for pair in pairs}
+def normalised_weights(
+    pairs: list[str], pair_weights: dict[str, float] | None = None
+) -> dict[str, float]:
+    pair_weights = DEFAULT_WEIGHTS if pair_weights is None else pair_weights
+    raw_weights = {pair: pair_weights.get(pair, 0) for pair in pairs}
+    if any(not np.isfinite(w) or w < 0 for w in raw_weights.values()):
+        raise ValueError("NEER weights must be finite and non-negative.")
     total_weight = sum(raw_weights.values())
     if total_weight <= 0:
         raise ValueError("At least one positive NEER weight is required.")

@@ -104,7 +104,7 @@ def get_composite_resampled_quote(
     Each source is loaded at most once, and lower priorities are skipped when
     the requested trading grid already has complete quotes.
     The base loader checks file availability in the provider's calendar before
-    extracting raw ZIPs. Sparse backups are matched on their available rows,
+    reading raw Parquet or extracting HISTDATA ZIPs. Sparse backups are matched on their available rows,
     without expanding each provider to another full requested grid.
 
     A missing timestamp or either non-finite price triggers whole-row fallback:

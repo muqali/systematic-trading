@@ -7,6 +7,11 @@ from pathlib import Path
 
 import pandas as pd
 
+from data.quote_cache import (
+    DEFAULT_CACHE_FORMAT, atomic_quote_output, read_parquet_quotes,
+    resolve_quote_cache, validate_cache_format, write_parquet_quotes,
+)
+
 from data.tick_data_loader import (
     ANNUAL_TICK_CHUNK_SIZE,
     DEFAULT_SOURCE,
@@ -129,28 +134,32 @@ def _load_cached_resampled_quote(
     # end_dt is exclusive: midnight on Jan 1 does not require that year's file.
     years = range(start_dt.year, (end_dt - pd.Timedelta(1, "ns")).year + 1)
     cache_paths = [
-        cache_dir / f"{source}_{cache_pair}_{freq_code}_{year}.csv"
+        resolve_quote_cache(cache_dir / f"{source}_{cache_pair}_{freq_code}_{year}.parquet")
         for year in years
     ]
 
-    if not all(path.is_file() for path in cache_paths):
+    if any(path is None for path in cache_paths):
         return None
 
     cached_frames = []
     for year, path in zip(years, cache_paths):
         try:
-            df = _read_quote_file(path)
+            if path.suffix == ".parquet":
+                df = read_parquet_quotes(path)
+            else:
+                df = _read_quote_file(path)
+                df.index = df.index.tz_localize(
+                    cache_timezone, ambiguous="NaT", nonexistent="NaT"
+                ).tz_convert(CACHE_TIMEZONE)
         except (pd.errors.EmptyDataError, pd.errors.ParserError, ValueError):
             return None
         if df.empty:
             continue
-        df.index = df.index.tz_localize(
-            cache_timezone, ambiguous="NaT", nonexistent="NaT"
-        ).tz_convert(CACHE_TIMEZONE)
         if (
             df.index.hasnans or not df.index.is_unique
             or not df.index.is_monotonic_increasing
-            or not (df.index.year == year).all()
+            or df.index[0] < pd.Timestamp(year, 1, 1, tz=CACHE_TIMEZONE)
+            or df.index[-1] >= pd.Timestamp(year + 1, 1, 1, tz=CACHE_TIMEZONE)
         ):
             return None
         df["mid"] = (df["bid"] + df["ask"]) / 2
@@ -186,9 +195,12 @@ def get_resampled_quote(
 
     Only registered provider prefixes (HISTDATA/DUKASCOPY) are cache sources.
     tick_data_dir contains normalized Eastern ticks; raw_data_dir overrides
-    Documents/data/<source>. prepared_raw_dir is reserved for temporary CSVs
-    already extracted by the exporter. Raw clock rules never apply to caches.
-    The compact, headerless Eastern resampled output format is unchanged.
+    Documents/data/<source>: HISTDATA ZIPs or DUKASCOPY raw Parquet only.
+    prepared_raw_dir normally supplies temporary HISTDATA CSVs already
+    extracted by the exporter. Raw clock rules never apply to caches.
+    Read typed Eastern Parquet caches, with legacy headerless CSV support.
+    Per year, Parquet is preferred unless the CSV is newer. No format migration
+    or other persistent writes occur during reads.
     Valid cache files for calendar years before the current US/Eastern year
     are assumed complete, even if arbitrarily sparse or missing holiday edges.
     Current/future-year caches are reused if their last timestamp reaches the
@@ -252,7 +264,7 @@ def get_resampled_quote(
             missing_years.append((start, end, cached))
 
     # Rebuild consecutive missing/invalid/outdated years together, preserving
-    # bars/fills between them without repeatedly extracting the same source ZIP.
+    # bars/fills between them without repeatedly reopening the same raw source.
     spans = []
     for start, end, cached in missing_years:
         if spans and spans[-1][1] == start:
@@ -501,16 +513,22 @@ def save_resampled_quotes(
     timestamp_format: str | None = None,
     use_cache: bool = False,
     overwrite: bool = False,
+    file_format: str = DEFAULT_CACHE_FORMAT,
 ) -> dict[str, dict[int, Path]]:
     """Write source-prefixed Eastern caches, resampling ticks by default.
 
     HISTDATA is the default output prefix even when the raw CSVs retain their
     original DAT_ASCII names. Resampling, forward filling and prices are
-    independent of the filename prefix. DUKASCOPY Unix-millisecond inputs use
-    the same headerless YYYYMMDD HHmmssSSS,bid,ask cache format and Eastern
-    timezone as before. Read normalized ticks when available, otherwise raw
-    ZIPs; explicitly setting raw_data_dir forces regeneration from raw ZIPs.
+    independent of the filename prefix. Parquet stores a timezone-aware Eastern
+    timestamp index and float64 bid/ask with Snappy compression. mid is derived
+    on read. file_format="csv" retains the legacy headerless
+    YYYYMMDD HHmmssSSS,bid,ask format. Refuse existing files in either format
+    unless overwrite=True; overwriting leaves the other representation intact.
+    Read normalized ticks when available, otherwise raw
+    provider files (HISTDATA ZIPs or DUKASCOPY raw Parquet); explicitly setting
+    raw_data_dir bypasses processed tick caches and uses those raw files.
     """
+    validate_cache_format(file_format)
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     source = DEFAULT_SOURCE if source is None else source
@@ -545,11 +563,11 @@ def save_resampled_quotes(
         )
         output_pair = source_settings.format_cache_pair(ccy_pair)
         year_paths = {
-            year: output_dir / f"{source}_{output_pair}_{freq_code}_{year}.csv"
+            year: output_dir / f"{source}_{output_pair}_{freq_code}_{year}.{file_format}"
             for year, _ in year_frames
         }
 
-        existing_paths = [path for path in year_paths.values() if path.exists()]
+        existing_paths = [path for path in year_paths.values() if resolve_quote_cache(path) is not None]
         if existing_paths and not overwrite:
             raise FileExistsError(
                 f"Refusing to overwrite existing output: {existing_paths[0]}"
@@ -558,13 +576,12 @@ def save_resampled_quotes(
         for year, year_df in year_frames:
             year_path = year_paths[year]
             output_df = year_df[["bid", "ask"]].copy()
-            output_df.index = _format_histdata_timestamp_index(year_df.index)
-            temporary_path = year_path.with_suffix(year_path.suffix + ".tmp")
-            try:
-                output_df.to_csv(temporary_path, header=False)
-                temporary_path.replace(year_path)
-            finally:
-                temporary_path.unlink(missing_ok=True)
+            with atomic_quote_output(year_path, overwrite=overwrite) as temporary_path:
+                if file_format == "parquet":
+                    write_parquet_quotes(output_df, temporary_path)
+                else:
+                    output_df.index = _format_histdata_timestamp_index(year_df.index)
+                    output_df.to_csv(temporary_path, header=False)
 
         saved_paths[ccy_pair] = year_paths
 

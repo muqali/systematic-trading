@@ -3,14 +3,20 @@ import os
 import tempfile
 from collections.abc import Callable, Iterable, Iterator
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import closing, contextmanager
+from contextlib import ExitStack, closing, contextmanager
 from dataclasses import dataclass, replace
 from functools import partial
 from pathlib import Path
 
 import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
 
 from data.tick_archives import extract_csv_from_zip
+from data.quote_cache import (
+    DEFAULT_CACHE_FORMAT, ParquetQuoteWriter, iter_parquet_quotes,
+    resolve_quote_cache, validate_cache_format,
+)
 
 CSV_DATA_DIR = Path.home() / "Programming" / "data" / "tickquote"
 RAW_DATA_ROOT = Path.home() / "Documents" / "data"
@@ -31,7 +37,7 @@ PROCESSED_TIMESTAMP_FORMAT = "%Y-%m-%d %H:%M:%S.%f%z"
 
 def dukascopy_tick_filename(ccy_pair: str, year: int) -> str:
     """Annual MarketData Hub name; next January 1 is the exclusive end date."""
-    return f"{ccy_pair.lower()}_tick_{year}0101_{year + 1}0101.csv"
+    return f"{ccy_pair.lower()}_tick_{year}0101_{year + 1}0101.parquet"
 
 
 def _locate_monthly_files(
@@ -42,6 +48,7 @@ def _locate_monthly_files(
     source: str,
     *,
     prefixes: tuple[str, ...] | None = None,
+    processed: bool = False,
 ) -> list[Path]:
     """Select the first existing prefix for each month, without duplicates."""
     prefixes = (source,) if prefixes is None else prefixes
@@ -54,6 +61,10 @@ def _locate_monthly_files(
         for prefix in prefixes:
             file_name = f"{prefix}_{ccy_pair}_T_{current_month.strftime('%Y%m')}.csv"
             file_path = data_dir / file_name
+            if processed:
+                file_path = resolve_quote_cache(file_path)
+                if file_path is None:
+                    continue
             if file_path.exists():
                 paths.append(file_path)
                 break
@@ -102,20 +113,12 @@ def _locate_histdata_archives(
     return paths
 
 
-def _locate_dukascopy_archives(
-    pair: str, start: dt.date, end: dt.date, directory: Path, source: str,
-) -> list[Path]:
-    return [
-        path for year in range(start.year, end.year + 1)
-        if (path := (directory / dukascopy_tick_filename(pair, year)).with_suffix(".zip")).is_file()
-    ]
-
-
 @dataclass(frozen=True)
 class RawSourceSettings:
     """Provider rules consumed by the shared tick and resampling pipelines.
 
-    Add a registry entry with ZIP and extracted-CSV locators for a new source.
+    Register a format and file locator for each source; find_archives is only
+    needed for ZIP-wrapped CSV sources. DUKASCOPY uses direct raw Parquet.
     Columns are declared in timestamp/bid/ask semantic order: header
     names for headed CSVs, zero-based positions for headerless CSVs. Formats
     are pandas date formats or ``unix_ms``. Directory factories resolve late
@@ -130,6 +133,7 @@ class RawSourceSettings:
     default_data_dir: Callable[[], Path] | None = None
     find_files: FileLocator = _locate_monthly_files
     find_archives: FileLocator | None = None
+    file_format: str = "csv"
     columns: tuple[str | int, str | int, str | int] = (0, 1, 2)
     has_header: bool = False
     require_ordered: bool = False
@@ -153,7 +157,7 @@ RAW_SOURCE_SETTINGS = {
         timestamp_format=DUKASCOPY_TIMESTAMP_FORMAT,
         default_data_dir=lambda: DUKASCOPY_DATA_DIR,
         find_files=_locate_dukascopy_files,
-        find_archives=_locate_dukascopy_archives,
+        file_format="parquet",
         columns=("timestamp", "bidPrice", "askPrice"),
         has_header=True,
         require_ordered=True,
@@ -188,12 +192,13 @@ def locate_files(
     data_dir: str | Path | None = None,
     source: str | None = DEFAULT_SOURCE,
 ) -> list[Path]:
-    """Find normalized monthly tick CSVs, never vendor files or raw archives."""
+    """Find one Parquet/legacy CSV per processed month, never raw inputs."""
     source = DEFAULT_SOURCE if source is None else source
     settings = get_raw_source_settings(source)
     directory = CSV_DATA_DIR if data_dir is None else Path(data_dir)
     return _locate_monthly_files(
-        settings.format_cache_pair(ccy_pair), start_date, end_date, directory, source
+        settings.format_cache_pair(ccy_pair), start_date, end_date, directory, source,
+        processed=True,
     )
 
 
@@ -209,10 +214,11 @@ def quote_input_files(
     prepared_raw_dir: str | Path | None = None,
     raw_time_window: tuple[pd.Timestamp, pd.Timestamp] | None = None,
 ) -> Iterator[tuple[Iterable[Path], bool]]:
-    """Yield (paths, processed): complete tick cache, otherwise raw ZIPs.
+    """Yield (paths, processed): complete tick cache, otherwise provider files.
 
-    raw_data_dir is a provider's ZIP root. prepared_raw_dir is only for the
-    exporter's already-extracted temporary CSVs. Neither is a processed cache.
+    raw_data_dir is the provider root: HISTDATA ZIPs or DUKASCOPY Parquet.
+    prepared_raw_dir supplies already-prepared raw files (normally temporary
+    HISTDATA CSVs). Neither is a processed cache.
     Supplying either raw directory explicitly bypasses the processed cache.
     raw_time_window narrows vendor file discovery using its registered file
     calendar; its endpoints conservatively include boundary ticks. Processed
@@ -242,7 +248,8 @@ def quote_input_files(
         if raw_data_dir is None else Path(raw_data_dir)
     )
     if settings.find_archives is None:
-        raise ValueError(f"Raw source {source!r} must register a ZIP file locator.")
+        yield settings.find_files(pair, raw_start, raw_end, directory, source), False
+        return
     archives = settings.find_archives(pair, raw_start, raw_end, directory, source)
     with tempfile.TemporaryDirectory(prefix=f"raw-ticks-{source}-") as staging:
         def extracted_paths():
@@ -258,7 +265,13 @@ def quote_input_files(
 def _iter_processed_tick_file(
     path: Path, chunksize: int = ANNUAL_TICK_CHUNK_SIZE,
 ) -> Iterator[pd.DataFrame]:
-    """Read the common headed schema; explicit offsets disambiguate DST folds."""
+    """Read bounded Parquet/CSV chunks, preserving DST folds and duplicate ticks."""
+    if path.suffix == ".parquet":
+        with closing(iter_parquet_quotes(path, chunksize)) as frames:
+            for df in frames:
+                df["mid"] = (df["bid"] + df["ask"]) / 2
+                yield df
+        return
     with pd.read_csv(
         path, usecols=["timestamp", "bid", "ask"],
         dtype={"timestamp": "string", "bid": "float64", "ask": "float64"},
@@ -336,11 +349,10 @@ def _read_tick_quote_file(
     timestamp_format: str | None = None,
 ) -> pd.DataFrame:
     """Read a raw file using its provider's schema, clock and timestamp format."""
-    return next(
-        _iter_tick_quote_file(
-            path, source_timezone, source=source, timestamp_format=timestamp_format
-        )
-    )
+    with closing(_iter_tick_quote_file(
+        path, source_timezone, source=source, timestamp_format=timestamp_format
+    )) as frames:
+        return next(frames)
 
 
 def _resolve_read_settings(
@@ -348,7 +360,7 @@ def _resolve_read_settings(
     source_timezone: str | None,
     timestamp_format: str | None,
 ) -> RawSourceSettings:
-    """Validate raw-only overrides once per file, before opening the CSV."""
+    """Validate raw-only overrides once per file, before opening it."""
     settings = get_raw_source_settings(source)
     if (
         settings.timestamp_format is not None
@@ -394,8 +406,15 @@ def _parse_raw_timestamp_index(
 ) -> pd.DatetimeIndex:
     """Convert the configured timestamp encoding to the common Eastern index."""
     if settings.timestamp_format == UNIX_MILLISECONDS_FORMAT:
-        # Text validation avoids silently accepting wrong units or old formats.
-        if not timestamps.str.fullmatch(r"[0-9]{13}", na=False).all():
+        # Direct Parquet stores int64, while CSV parsing supplies strings.
+        # Validate both units and nulls instead of guessing or truncating floats.
+        if pd.api.types.is_integer_dtype(timestamps.dtype):
+            valid = timestamps.between(1_000_000_000_000, 9_999_999_999_999).fillna(False).all()
+        elif pd.api.types.is_string_dtype(timestamps.dtype):
+            valid = timestamps.str.fullmatch(r"[0-9]{13}", na=False).all()
+        else:
+            valid = False
+        if not valid:
             raise ValueError(
                 f"Unparseable {source} timestamps in {path}; "
                 f"expected format {settings.timestamp_format!r} "
@@ -427,6 +446,36 @@ def _check_timestamp_order(
     return index[-1]
 
 
+def _iter_raw_source_frames(path, settings, chunksize):
+    """Storage-specific IO only; normalization and ordering remain shared."""
+    if settings.file_format == "csv":
+        reader = pd.read_csv(path, **_csv_read_options(settings, chunksize))
+        if chunksize is None:
+            yield reader
+        else:
+            with reader:
+                yield from reader
+        return
+    if settings.file_format != "parquet":
+        raise ValueError(f"Unsupported raw file format: {settings.file_format!r}")
+    if path.suffix.lower() != ".parquet":
+        raise ValueError(f"Raw source requires a .parquet file: {path}")
+    with pq.ParquetFile(path) as reader:
+        schema = reader.schema_arrow
+        if len(set(schema.names)) != len(schema.names) or not set(settings.columns) <= set(schema.names):
+            raise ValueError(f"Missing or duplicate raw Parquet columns in {path}; require {settings.columns}")
+        timestamp, bid, ask = settings.columns
+        if settings.timestamp_format == UNIX_MILLISECONDS_FORMAT and schema.field(timestamp).type != pa.int64():
+            raise ValueError(f"Raw Parquet timestamp must be int64 unix_ms (13-digit UTC Unix milliseconds): {path}")
+        if any(schema.field(name).type != pa.float64() for name in (bid, ask)):
+            raise ValueError(f"Raw Parquet bid/ask prices must be float64: {path}")
+        if chunksize is None:
+            yield reader.read(columns=list(settings.columns)).to_pandas(ignore_metadata=True)
+        else:
+            for batch in reader.iter_batches(batch_size=chunksize, columns=list(settings.columns)):
+                yield batch.to_pandas(ignore_metadata=True)
+
+
 def _iter_tick_quote_file(
     path: Path,
     source_timezone: str | None = None,
@@ -435,8 +484,10 @@ def _iter_tick_quote_file(
     timestamp_format: str | None = None,
     chunksize: int | None = None,
 ) -> Iterator[pd.DataFrame]:
-    """Read raw quotes with one configured format per source (not cache CSVs).
+    """Read raw quotes with the source's storage and timestamp formats.
 
+    HISTDATA reads extracted CSVs; DUKASCOPY reads annual raw Parquet directly,
+    projecting only timestamp/bid/ask and preserving bounded chunk sizes.
     Explicit formats may repeat a registered source's format, but cannot
     override it. No alternate-format detection is performed.
     Unix millisecond timestamps are absolute instants and cannot be
@@ -445,10 +496,8 @@ def _iter_tick_quote_file(
     source = DEFAULT_SOURCE if source is None else source
     settings = _resolve_read_settings(source, source_timezone, timestamp_format)
     column_names = dict(zip(settings.columns, ("timestamp", "bid", "ask")))
-    reader = pd.read_csv(path, **_csv_read_options(settings, chunksize))
-    frames = [reader] if chunksize is None else reader
     last_timestamp = None
-    try:
+    with closing(_iter_raw_source_frames(path, settings, chunksize)) as frames:
         for df in frames:
             df = df.rename(columns=column_names)
             index = _parse_raw_timestamp_index(df["timestamp"], settings, source, path)
@@ -462,9 +511,6 @@ def _iter_tick_quote_file(
                 )
             df["mid"] = (df["bid"] + df["ask"]) / 2
             yield df
-    finally:
-        if chunksize is not None:
-            reader.close()
 
 
 def _get_tick_quote_generator(
@@ -479,7 +525,7 @@ def _get_tick_quote_generator(
     raw_data_dir: str | Path | None = None,
     prepared_raw_dir: str | Path | None = None,
 ) -> Iterator[pd.DataFrame]:
-    """Read normalized ticks, falling back to ZIPs without writing a cache."""
+    """Read normalized ticks, falling back to provider files without caching."""
     with quote_input_files(
         ccy_pair, start_date, end_date, source=source, tick_data_dir=data_dir,
         raw_data_dir=raw_data_dir, prepared_raw_dir=prepared_raw_dir,
@@ -507,12 +553,13 @@ def get_tick_quote(
     source: str | None = DEFAULT_SOURCE,
     timestamp_format: str | None = None,
 ) -> pd.DataFrame:
-    """Load Eastern ticks from processed files or the configured source ZIPs.
+    """Load Eastern ticks from processed files or configured raw source files.
 
-    data_dir contains processed monthly SOURCE_PAIR_T_YYYYMM.csv files.
+    data_dir contains processed monthly SOURCE_PAIR_T_YYYYMM.parquet files
+    or legacy .csv files. Parquet is preferred unless the CSV is newer.
     It defaults to Programming/data/tickquote and does not select raw inputs.
-    Missing cache months fall back to the source's configured ZIP folder,
-    normally Documents/data/<source>.
+    Missing cache months fall back to Documents/data/<source>: monthly ZIPs
+    for HISTDATA, annual raw Parquet for DUKASCOPY (never CSV/ZIP fallback).
     Clock/format overrides apply only to raw inputs, never processed ticks.
     Reads do not populate persistent files; use save_tick_quotes to do that.
     Filter each chunk before retaining it, so memory scales with the requested
@@ -570,7 +617,7 @@ def get_tick_quotes(
     """Load each pair's Eastern ticks using the same options as get_tick_quote.
 
     data_dir selects processed tick files only. Missing cache months fall back
-    to the configured source ZIP folder, normally Documents/data/<source>.
+    to configured HISTDATA ZIPs or DUKASCOPY Parquet in Documents/data/<source>.
     """
     def load_one(ccy_pair: str) -> pd.DataFrame:
         return get_tick_quote(
@@ -610,22 +657,27 @@ def save_tick_quotes(
     raw_data_dir: str | Path | None = None,
     overwrite: bool = False,
     resume: bool = False,
+    file_format: str = DEFAULT_CACHE_FORMAT,
 ) -> dict[str, dict[str, Path]]:
-    """Normalize raw ZIPs to monthly headed timestamp,bid,ask tick CSVs.
+    """Normalize HISTDATA ZIPs/DUKASCOPY Parquet to monthly processed quotes.
 
     Export complete Eastern calendar months intersecting the date range (not
-    the 17:00 trading-day window used by get_tick_quote). Offset-bearing
-    timestamps retain milliseconds and both instances of a DST repeated hour.
+    the 17:00 trading-day window used by get_tick_quote). Typed, timezone-aware
+    Eastern timestamps retain precision and both instances of a DST repeated
+    hour. Prices are float64; Parquet uses Snappy. file_format="csv" retains
+    the legacy headed CSV with explicit UTC offsets.
     Duplicate timestamps and crossed quotes are preserved; mid is derived on
-    read. ZIPs remain untouched. Writes are staged, then atomically published
+    read. Raw source files remain untouched. Writes are staged, then atomically published
     per file only after the pair's input has been read successfully. resume
-    skips existing monthly files; overwrite replaces them. These options are
+    skips months present in either format; overwrite replaces the requested
+    format without deleting the other representation. These options are
     mutually exclusive. Missing source months are not manufactured or filled.
     """
     if start_date > end_date:
         raise ValueError("start_date must not be after end_date")
     if overwrite and resume:
         raise ValueError("overwrite and resume are mutually exclusive")
+    validate_cache_format(file_format)
     source = DEFAULT_SOURCE if source is None else source
     settings = get_raw_source_settings(source)
     output_dir = CSV_DATA_DIR if output_dir is None else Path(output_dir)
@@ -642,14 +694,15 @@ def save_tick_quotes(
         output_pair = settings.format_cache_pair(pair)
         targets = {
             month.strftime("%Y%m"):
-            output_dir / f"{source}_{output_pair}_T_{month.strftime('%Y%m')}.csv"
+            output_dir / f"{source}_{output_pair}_T_{month.strftime('%Y%m')}.{file_format}"
             for month in months
         }
         for target in targets.values():
-            if target.exists() and not (overwrite or resume):
+            if resolve_quote_cache(target) is not None and not (overwrite or resume):
                 raise FileExistsError(f"Refusing to overwrite existing output: {target}")
         skipped = {
-            month: path for month, path in targets.items() if resume and path.exists()
+            month: existing for month, path in targets.items()
+            if resume and (existing := resolve_quote_cache(path)) is not None
         }
         if len(skipped) == len(targets):
             saved[pair] = skipped
@@ -663,20 +716,27 @@ def save_tick_quotes(
                 source=source, raw_data_dir=raw_root,
             )) as frames,
         ):
-            for df in frames:
-                df = df.loc[(df.index >= start) & (df.index < end), ["bid", "ask"]]
-                if df.empty:
-                    continue
-                month_numbers = df.index.year * 100 + df.index.month
-                for month_number, part in df.groupby(month_numbers, sort=False):
-                    month = str(month_number)
-                    if month in skipped:
+            with ExitStack() as stack:
+                writers = {}
+                for df in frames:
+                    df = df.loc[(df.index >= start) & (df.index < end), ["bid", "ask"]]
+                    if df.empty:
                         continue
-                    staged = Path(staging) / targets[month].name
-                    part = part.copy()
-                    part.index = _format_processed_tick_index(part.index)
-                    part.to_csv(staged, mode="a", header=not staged.exists())
-                    written[month] = targets[month]
+                    month_numbers = df.index.year * 100 + df.index.month
+                    for month_number, part in df.groupby(month_numbers, sort=False):
+                        month = str(month_number)
+                        if month in skipped:
+                            continue
+                        staged = Path(staging) / targets[month].name
+                        if file_format == "parquet":
+                            if month not in writers:
+                                writers[month] = stack.enter_context(ParquetQuoteWriter(staged))
+                            writers[month].write(part)
+                        else:
+                            part = part.copy()
+                            part.index = _format_processed_tick_index(part.index)
+                            part.to_csv(staged, mode="a", header=not staged.exists())
+                        written[month] = targets[month]
             if not written and not skipped:
                 raise FileNotFoundError(f"No raw {source} ticks for {pair} in {start_date}..{end_date}")
             for month, target in written.items():
